@@ -1,0 +1,27 @@
+{
+  "date": "2026-11-12",
+  "baseline_commit": "9288bfe",
+  "host": {
+    "os": "Windows 11 Pro 10.0.26300",
+    "cpu": "13th Gen Intel Core i9-13900KF",
+    "backing": "two fresh 32 MiB PoolFS image files on C: per run"
+  },
+  "method": {
+    "mounts": "baseline Q:, optimized R:; user P: was not benchmarked",
+    "sequential_size_mib": 8,
+    "small_writes": 128,
+    "flushes": 64,
+    "full_file_overwrites": 16,
+    "overwritten_read_samples": 9,
+    "metadata_files": 40,
+    "run_order": ["baseline-1", "optimized-1", "baseline-2", "optimized-2", "optimized-3", "baseline-3"]
+  },
+  "runs": [
+    {"variant":"baseline","run":1,"seq_write_mib_s":357.715,"seq_read_mib_s":2038.476,"small_write_ms_mean":1.874,"clean_flush_ms_mean":0.387,"overwrite_read_ms_median":2.339,"create_ms_mean":1.447,"delete_ms_mean":1.578},
+    {"variant":"optimized","run":1,"seq_write_mib_s":324.803,"seq_read_mib_s":1942.785,"small_write_ms_mean":2.695,"clean_flush_ms_mean":0.037,"overwrite_read_ms_median":0.352,"create_ms_mean":1.820,"delete_ms_mean":2.229},
+    {"variant":"baseline","run":2,"seq_write_mib_s":326.199,"seq_read_mib_s":1841.917,"small_write_ms_mean":2.270,"clean_flush_ms_mean":0.373,"overwrite_read_ms_median":3.145,"create_ms_mean":1.622,"delete_ms_mean":1.790},
+    {"variant":"optimized","run":2,"seq_write_mib_s":299.925,"seq_read_mib_s":1844.763,"small_write_ms_mean":2.225,"clean_flush_ms_mean":0.027,"overwrite_read_ms_median":0.354,"create_ms_mean":1.539,"delete_ms_mean":2.149},
+    {"variant":"optimized","run":3,"seq_write_mib_s":340.373,"seq_read_mib_s":1869.465,"small_write_ms_mean":2.118,"clean_flush_ms_mean":0.032,"overwrite_read_ms_median":0.352,"create_ms_mean":1.637,"delete_ms_mean":2.371},
+    {"variant":"baseline","run":3,"seq_write_mib_s":307.670,"seq_read_mib_s":1931.481,"small_write_ms_mean":3.159,"clean_flush_ms_mean":0.356,"overwrite_read_ms_median":3.939,"create_ms_mean":1.744,"delete_ms_mean":1.920}
+  ]
+}

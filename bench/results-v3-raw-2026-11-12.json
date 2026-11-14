@@ -1,0 +1,46 @@
+{
+  "date": "2026-11-12",
+  "format": "PoolFS raw v3 on three GPT basic-data partitions across two VHDX disks",
+  "mount": "global WinFsp P: visible to an ordinary user process",
+  "members": [
+    {
+      "disk_number_at_test": 1,
+      "partition_bytes": 4294967296
+    },
+    {
+      "disk_number_at_test": 1,
+      "partition_bytes": 4294967296
+    },
+    {
+      "disk_number_at_test": 2,
+      "partition_bytes": 6442450944
+    }
+  ],
+  "method": {
+    "command": "poolfs-bench.exe P:\\ v3raw-001 8",
+    "runs": 1,
+    "sequential_size_mib": 8,
+    "small_writes": 128,
+    "flushes": 64,
+    "full_file_overwrites": 16,
+    "overwritten_read_samples": 9,
+    "metadata_files": 40
+  },
+  "run": {
+    "version": 1,
+    "size_mib": 8,
+    "seq_write_mib_s": 337.607,
+    "seq_read_mib_s": 1193.353,
+    "small_write_ms_mean": 2.226,
+    "clean_flush_ms_mean": 0.031,
+    "overwrite_read_ms_median": 0.713,
+    "create_ms_mean": 2.448,
+    "delete_ms_mean": 3.081
+  },
+  "functional_validation": {
+    "large_file_bytes": 2149580800,
+    "large_file_sha256_before_and_after_remount": "0CD6080E406754F554314E062556F57ED047BD3CA57464861ABA0BD4CFF07B22",
+    "first_data_block_present_on_all_three_members": true,
+    "small_text_and_8193_byte_binary_persisted_after_remount": true
+  }
+}

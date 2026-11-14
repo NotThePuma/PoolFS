@@ -1,0 +1,49 @@
+{
+  "date": "2026-11-12",
+  "format": "PoolFS v3 file-backed pool on two NTFS partitions across two VHDX disks",
+  "mount": "per-user WinFsp Q: alongside the existing raw PoolFS P:",
+  "hosts": [
+    {
+      "disk_number_at_test": 1,
+      "drive_letter": "T:",
+      "file_system": "NTFS",
+      "member_path": "T:\\PoolFS\\member.img",
+      "member_bytes": 536870912
+    },
+    {
+      "disk_number_at_test": 2,
+      "drive_letter": "U:",
+      "file_system": "NTFS",
+      "member_path": "U:\\PoolFS\\member.img",
+      "member_bytes": 536870912
+    }
+  ],
+  "pool_data_capacity_bytes": 805306368,
+  "method": {
+    "command": "poolfs-bench.exe Q:\\ ntfsv3-001 8",
+    "runs": 1,
+    "sequential_size_mib": 8,
+    "small_writes": 128,
+    "flushes": 64,
+    "full_file_overwrites": 16,
+    "overwritten_read_samples": 9,
+    "metadata_files": 40
+  },
+  "run": {
+    "version": 1,
+    "size_mib": 8,
+    "seq_write_mib_s": 156.57,
+    "seq_read_mib_s": 1712.182,
+    "small_write_ms_mean": 2.907,
+    "clean_flush_ms_mean": 0.033,
+    "overwrite_read_ms_median": 0.339,
+    "create_ms_mean": 1.95,
+    "delete_ms_mean": 2.059
+  },
+  "functional_validation": {
+    "spanning_file_bytes": 403701760,
+    "spanning_file_sha256_before_and_after_remount": "CA89FDE61997BF068001B01B40C9EE682FFD8F15701CCE0556F1F224F547C887",
+    "host_ntfs_sentinel_files_remained_accessible": true,
+    "existing_raw_pool_p_remained_accessible": true
+  }
+}

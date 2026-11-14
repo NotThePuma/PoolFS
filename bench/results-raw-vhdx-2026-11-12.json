@@ -1,0 +1,51 @@
+{
+  "date": "2026-11-12",
+  "format": "PoolFS raw v2 on two dedicated VHDX GPT basic-data partitions",
+  "members": [
+    {
+      "disk_number_at_test": 1,
+      "partition_bytes": 10718543872,
+      "poolfs_usable_member_bytes": 10701766656
+    },
+    {
+      "disk_number_at_test": 2,
+      "partition_bytes": 8571060224,
+      "poolfs_usable_member_bytes": 8554283008
+    }
+  ],
+  "method": {
+    "mount": "WinFsp P: in an elevated session before the global mount-point change",
+    "sequential_size_mib": 8,
+    "small_writes": 128,
+    "flushes": 64,
+    "full_file_overwrites": 16,
+    "overwritten_read_samples": 9,
+    "metadata_files": 40,
+    "first_run_source": "rounded stderr summary; JSON was lost by a PowerShell capture error after the benchmark succeeded",
+    "second_run_source": "full JSON stdout from poolfs-bench.exe"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "precision": "two decimal places",
+      "seq_write_mib_s": 247.51,
+      "seq_read_mib_s": 1155.3,
+      "small_write_ms_mean": 2.15,
+      "clean_flush_ms_mean": 0.03,
+      "overwrite_read_ms_median": 0.69,
+      "create_ms_mean": 1.47,
+      "delete_ms_mean": 1.65
+    },
+    {
+      "run": 2,
+      "precision": "three decimal places",
+      "seq_write_mib_s": 428.249,
+      "seq_read_mib_s": 1268.372,
+      "small_write_ms_mean": 1.704,
+      "clean_flush_ms_mean": 0.024,
+      "overwrite_read_ms_median": 0.801,
+      "create_ms_mean": 1.809,
+      "delete_ms_mean": 1.912
+    }
+  ]
+}

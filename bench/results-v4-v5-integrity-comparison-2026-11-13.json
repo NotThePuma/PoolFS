@@ -1,0 +1,35 @@
+[
+  {
+    "version": 1,
+    "size_mib": 8,
+    "seq_write_mib_s": 52.519,
+    "seq_read_mib_s": 1878.375,
+    "small_write_ms_mean": 3.463,
+    "clean_flush_ms_mean": 0.029,
+    "overwrite_read_ms_median": 0.447,
+    "create_ms_mean": 2.816,
+    "delete_ms_mean": 3.017
+  },
+  {
+    "version": 1,
+    "size_mib": 8,
+    "seq_write_mib_s": 338.533,
+    "seq_read_mib_s": 2004.611,
+    "small_write_ms_mean": 2.045,
+    "clean_flush_ms_mean": 0.03,
+    "overwrite_read_ms_median": 0.445,
+    "create_ms_mean": 1.744,
+    "delete_ms_mean": 1.823
+  },
+  {
+    "version": 1,
+    "size_mib": 8,
+    "seq_write_mib_s": 332.418,
+    "seq_read_mib_s": 2005.465,
+    "small_write_ms_mean": 2.185,
+    "clean_flush_ms_mean": 0.029,
+    "overwrite_read_ms_median": 0.41,
+    "create_ms_mean": 1.576,
+    "delete_ms_mean": 1.722
+  }
+]

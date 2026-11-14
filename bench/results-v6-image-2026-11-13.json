@@ -1,0 +1,42 @@
+{
+  "date": "2026-11-13",
+  "format": "v6",
+  "backing": "two 384 MiB image files on C: NTFS, mounted at R:",
+  "host": "Windows 11 Pro",
+  "size_mib": 8,
+  "runs": [
+    {
+      "version": 1,
+      "size_mib": 8,
+      "seq_write_mib_s": 97.127,
+      "seq_read_mib_s": 1121.894,
+      "small_write_ms_mean": 3.406,
+      "clean_flush_ms_mean": 0.028,
+      "overwrite_read_ms_median": 0.834,
+      "create_ms_mean": 2.725,
+      "delete_ms_mean": 2.589
+    },
+    {
+      "version": 1,
+      "size_mib": 8,
+      "seq_write_mib_s": 89.624,
+      "seq_read_mib_s": 1168.736,
+      "small_write_ms_mean": 3.677,
+      "clean_flush_ms_mean": 0.031,
+      "overwrite_read_ms_median": 0.746,
+      "create_ms_mean": 1.565,
+      "delete_ms_mean": 1.663
+    },
+    {
+      "version": 1,
+      "size_mib": 8,
+      "seq_write_mib_s": 292.435,
+      "seq_read_mib_s": 1014.585,
+      "small_write_ms_mean": 2.358,
+      "clean_flush_ms_mean": 0.03,
+      "overwrite_read_ms_median": 0.772,
+      "create_ms_mean": 1.502,
+      "delete_ms_mean": 1.616
+    }
+  ]
+}

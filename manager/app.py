@@ -1,0 +1,1978 @@
+"""PoolFS desktop manager. Qt owns presentation; the C++ bridge owns storage."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Any, Callable
+
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRegularExpression
+from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QRegularExpressionValidator
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
+    QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget, QAbstractItemView,
+)
+
+from backend import BridgeError, NativeBackend, PartitionRequest
+
+
+MIB = 1024 * 1024
+MIN_IMAGE_MIB = 384
+MAX_IMAGE_MIB = ((1 << 63) - 1) // MIB
+MAX_SLIDER_STEPS = 1_000_000
+NEW_POOL_NAME = "New Pool"
+STYLE = """
+QWidget { color: #edf3ff; font-family: "Segoe UI"; font-size: 12px; }
+QMainWindow, QWidget#root { background: #0b1220; }
+QLabel { background: transparent; }
+QFrame#sidebar { background: #0e1928; border-right: 1px solid #24354b; }
+QFrame#card { background: #121d2e; border: 1px solid #2b3b52; border-radius: 15px; }
+QFrame#accentCard { background: #15343d; border: 1px solid #35716f; border-radius: 15px; }
+QFrame#metricCard { background: #162438; border: 1px solid #2b3b52; border-radius: 12px; }
+QFrame#statusBar { background: #101c2c; border-top: 1px solid #26384e; }
+QLabel#eyebrow { color: #77e5c1; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+QLabel#title { color: #f0f6ff; font-size: 29px; font-weight: 700; }
+QLabel#section { color: #edf3ff; font-size: 18px; font-weight: 650; }
+QLabel#muted { color: #9db0c9; font-size: 12px; }
+QLabel#micro { color: #8198b5; font-size: 10px; font-weight: 650; }
+QLabel#metricValue { color: #f4f8ff; font-size: 25px; font-weight: 700; }
+QPushButton { border: 1px solid #334760; border-radius: 9px; padding: 9px 14px;
+              background: #24354d; color: #e9f2ff; font-weight: 600; }
+QPushButton:hover { background: #304663; border-color: #6b91a8; }
+QPushButton:pressed { background: #1c2d42; }
+QPushButton:disabled { color: #6f8198; background: #182638; border-color: #27384d; }
+QPushButton#primary { background: #77e5c1; border-color: #77e5c1; color: #092018; }
+QPushButton#primary:hover { background: #9cf1d4; border-color: #9cf1d4; }
+QPushButton#primary:disabled { background: #285247; border-color: #285247; color: #6d9b8b; }
+QPushButton#nav { background: transparent; border: none; border-radius: 9px;
+                  text-align: left; color: #9db0c9; padding: 12px 16px; font-size: 13px; }
+QPushButton#nav:hover { background: #1a2a3d; color: #edf3ff; }
+QPushButton#nav:checked { background: #1d3941; color: #77e5c1; }
+QTableWidget { background: #121d2e; alternate-background-color: #17253a;
+               border: none; gridline-color: #2a3950; selection-background-color: #214c51;
+               selection-color: #ffffff; outline: none; }
+QTableWidget::item { padding: 6px 9px; border-bottom: 1px solid #223248; }
+QTableWidget::item:selected { background: #214c51; color: #ffffff; }
+QTableWidget::indicator { width: 17px; height: 17px; }
+QTableWidget::indicator:unchecked { background: #1b2d43; border: 2px solid #8cb7cc;
+                                    border-radius: 4px; }
+QTableWidget::indicator:unchecked:hover { border-color: #77e5c1; }
+QTableWidget::indicator:checked { background: #77e5c1; border: 2px solid #77e5c1;
+                                  border-radius: 4px; }
+QHeaderView::section { background: #1c2b40; color: #a9bfd8; border: none;
+                       border-bottom: 1px solid #33455e; padding: 8px 9px; font-weight: 600; }
+QLineEdit, QComboBox, QSpinBox { background: #17263a; border: 1px solid #39506c;
+                                 border-radius: 7px; padding: 7px; color: #edf3ff; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #77e5c1; }
+QSlider::groove:horizontal { height: 6px; border-radius: 3px; background: #30445e; }
+QSlider::sub-page:horizontal { border-radius: 3px; background: #77e5c1; }
+QSlider::handle:horizontal { width: 17px; margin: -6px 0; border-radius: 8px;
+                             background: #e5fff4; border: 2px solid #77e5c1; }
+QSlider:disabled::handle:horizontal { background: #62768b; border-color: #62768b; }
+QComboBox QAbstractItemView { background: #17263a; selection-background-color: #214c51; }
+QCheckBox { spacing: 8px; color: #d7e5f6; }
+QCheckBox::indicator { width: 16px; height: 16px; }
+QScrollArea { border: none; background: transparent; }
+QScrollArea QWidget#qt_scrollarea_viewport, QWidget#page { background: #0b1220; }
+QScrollBar:vertical { width: 10px; background: #111d2d; }
+QScrollBar::handle:vertical { background: #344c65; border-radius: 5px; min-height: 30px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QMessageBox, QDialog { background: #121d2e; }
+"""
+
+
+def label(text: str, kind: str | None = None, wrap: bool = False) -> QLabel:
+    item = QLabel(text)
+    if kind:
+        item.setObjectName(kind)
+    item.setWordWrap(wrap)
+    return item
+
+
+def button(text: str, callback: Callable[[], None], primary: bool = False) -> QPushButton:
+    item = QPushButton(text)
+    if primary:
+        item.setObjectName("primary")
+    item.clicked.connect(callback)
+    return item
+
+
+def card(accent: bool = False) -> tuple[QFrame, QVBoxLayout]:
+    frame = QFrame()
+    frame.setObjectName("accentCard" if accent else "card")
+    box = QVBoxLayout(frame)
+    box.setContentsMargins(20, 18, 20, 18)
+    box.setSpacing(11)
+    return frame, box
+
+
+def table(headers: list[str], multi: bool = False) -> QTableWidget:
+    widget = QTableWidget(0, len(headers))
+    widget.setHorizontalHeaderLabels(headers)
+    widget.verticalHeader().hide()
+    widget.setShowGrid(False)
+    widget.setAlternatingRowColors(True)
+    widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    widget.setSelectionMode(
+        QAbstractItemView.SelectionMode.ExtendedSelection if multi
+        else QAbstractItemView.SelectionMode.SingleSelection
+    )
+    widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    widget.horizontalHeader().setStretchLastSection(True)
+    widget.setMinimumHeight(135)
+    return widget
+
+
+def human_size(value: Any) -> str:
+    if value is None:
+        return "Unknown"
+    number = float(value)
+    if number >= 1024**3:
+        return f"{number / 1024**3:.1f} GiB"
+    if number >= MIB:
+        return f"{number / MIB:.0f} MiB"
+    return f"{number:,.0f} B"
+
+
+def validate_pool_name(name: str) -> str:
+    try:
+        units = len(name.encode("utf-16-le")) // 2
+    except UnicodeEncodeError as exc:
+        raise ValueError("Pool name contains an invalid Unicode character.") from exc
+    if not 1 <= units <= 32:
+        raise ValueError("Pool name must be 1 to 32 characters long.")
+    if name != name.strip(" ") or name.endswith("."):
+        raise ValueError("Pool name cannot start or end with a space or end with a period.")
+    if any(ord(char) < 32 or ord(char) == 127 or char in '<>:/\\|?*"' for char in name):
+        raise ValueError("Pool name contains a character Windows cannot use in a drive label.")
+    return name
+
+
+class Task(QThread):
+    result = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, action: Callable[[], Any], parent: QWidget) -> None:
+        super().__init__(parent)
+        self.action = action
+
+    def run(self) -> None:
+        try:
+            self.result.emit(self.action())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class PasswordDialog(QDialog):
+    def __init__(self, parent: QWidget, title: str, confirm: bool = False) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(390)
+        box = QVBoxLayout(self)
+        box.setContentsMargins(22, 22, 22, 18)
+        box.setSpacing(14)
+        box.addWidget(label("PoolFS password", "section"))
+        box.addWidget(label("The password is used for this operation and is never saved in the config.", "muted", True))
+        self.first = QLineEdit()
+        self.first.setEchoMode(QLineEdit.EchoMode.Password)
+        self.first.setPlaceholderText("Enter password")
+        box.addWidget(self.first)
+        self.second: QLineEdit | None = None
+        if confirm:
+            self.second = QLineEdit()
+            self.second.setEchoMode(QLineEdit.EchoMode.Password)
+            self.second.setPlaceholderText("Confirm password")
+            box.addWidget(self.second)
+        controls = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        controls.accepted.connect(self._accept)
+        controls.rejected.connect(self.reject)
+        box.addWidget(controls)
+
+    def _accept(self) -> None:
+        if not self.first.text():
+            QMessageBox.warning(self, "Password required", "Enter the PoolFS password.")
+            return
+        if self.second is not None and self.first.text() != self.second.text():
+            QMessageBox.warning(self, "Passwords differ", "The two passwords do not match.")
+            self.second.clear()
+            return
+        self.accept()
+
+    def take_password(self) -> str:
+        value = self.first.text()
+        self.first.clear()
+        if self.second is not None:
+            self.second.clear()
+        return value
+
+
+class ManagerWindow(QMainWindow):
+    def __init__(self, backend: NativeBackend | None = None, auto_refresh: bool = True) -> None:
+        super().__init__()
+        self.backend = backend
+        self.inventory: dict[str, Any] = {"disks": [], "volumes": []}
+        self.host_volumes: list[dict[str, Any]] = []
+        self.config: dict[str, Any] | None = None
+        self.config_path: str | None = None
+        self.members: list[dict[str, Any]] = []
+        self.images: list[dict[str, Any]] = []
+        self._images_scanned = False
+        self._tasks: set[Task] = set()
+        self._running_operation = False
+        self.setWindowTitle("PoolFS Manager")
+        self.resize(1320, 870)
+        self.setMinimumSize(1050, 690)
+        self._build_shell()
+        self._size_validation_timer = QTimer(self)
+        self._size_validation_timer.setSingleShot(True)
+        self._size_validation_timer.timeout.connect(self._refresh_create_button)
+        self._set_page("Pool")
+        self._refresh_members()
+        if auto_refresh:
+            QTimer.singleShot(0, self.refresh_inventory)
+
+    def _build_shell(self) -> None:
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        shell = QVBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        shell.addLayout(body, 1)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(222)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(18, 24, 18, 20)
+        side.setSpacing(9)
+        brand = QHBoxLayout()
+        mark = label("P")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(38, 38)
+        mark.setStyleSheet("background:#77e5c1;color:#092018;border-radius:10px;font-size:22px;font-weight:800;")
+        brand.addWidget(mark)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        names.addWidget(label("PoolFS", "section"))
+        names.addWidget(label("MANAGER", "micro"))
+        brand.addLayout(names)
+        brand.addStretch()
+        side.addLayout(brand)
+        side.addSpacing(29)
+        side.addWidget(label("WORKSPACE", "micro"))
+        self.nav: dict[str, QPushButton] = {}
+        for name, glyph in (("Pool", "◉"), ("Storage", "▦"), ("Images", "▤")):
+            item = QPushButton(f"{glyph}    {name}")
+            item.setObjectName("nav")
+            item.setCheckable(True)
+            item.clicked.connect(lambda checked=False, page=name: self._set_page(page))
+            side.addWidget(item)
+            self.nav[name] = item
+        side.addStretch()
+        about, about_box = card()
+        about_box.addWidget(label("POOL FORMAT", "micro"))
+        about_box.addWidget(label("v6 · image-backed pools"))
+        about_box.addWidget(label("All members required to mount", "muted", True))
+        winfsp_notice = label(
+            'WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos<br>'
+            '<a href="https://github.com/winfsp/winfsp">WinFsp source</a>',
+            "muted", True,
+        )
+        winfsp_notice.setOpenExternalLinks(True)
+        about_box.addWidget(winfsp_notice)
+        side.addWidget(about)
+        body.addWidget(sidebar)
+
+        main = QWidget()
+        main_box = QVBoxLayout(main)
+        main_box.setContentsMargins(28, 24, 28, 22)
+        main_box.setSpacing(17)
+        header = QHBoxLayout()
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(3)
+        title_stack.addWidget(label("YOUR STORAGE, IN ONE PLACE", "eyebrow"))
+        self.page_title = label("Pool", "title")
+        title_stack.addWidget(self.page_title)
+        self.page_subtitle = label("", "muted")
+        title_stack.addWidget(self.page_subtitle)
+        header.addLayout(title_stack, 1)
+        badge = label("●  LOCAL MACHINE", "micro")
+        badge.setStyleSheet("background:#1a2b3e;border-radius:10px;padding:10px 13px;color:#bdd1e9;")
+        header.addWidget(badge, alignment=Qt.AlignmentFlag.AlignTop)
+        main_box.addLayout(header)
+        self.pages = QStackedWidget()
+        main_box.addWidget(self.pages, 1)
+        self.pages.addWidget(self._build_pool_page())
+        self.pages.addWidget(self._build_storage_page())
+        self.pages.addWidget(self._build_images_page())
+        body.addWidget(main, 1)
+
+        status_frame = QFrame()
+        status_frame.setObjectName("statusBar")
+        status_frame.setFixedHeight(40)
+        status_box = QHBoxLayout(status_frame)
+        status_box.setContentsMargins(23, 0, 23, 0)
+        self.status = label("Loading local storage…", "muted")
+        status_box.addWidget(self.status, 1)
+        status_box.addWidget(label("PoolFS  •  local only", "micro"))
+        shell.addWidget(status_frame)
+
+    def _scroll_page(self, content: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(content)
+        return area
+
+    def _build_pool_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("page")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 10, 5)
+        layout.setSpacing(16)
+        current, current_box = card()
+        top = QHBoxLayout()
+        detail = QVBoxLayout()
+        detail.setSpacing(5)
+        detail.addWidget(label("CURRENT POOL", "eyebrow"))
+        self.config_name = label("No config loaded", "section")
+        detail.addWidget(self.config_name)
+        self.config_location = label("Open a JSON config or select host volumes to start a new pool.", "muted", True)
+        detail.addWidget(self.config_location)
+        top.addLayout(detail, 1)
+        top.addWidget(button("New pool", self.new_pool))
+        top.addWidget(button("Open config", self.open_config, True))
+        current_box.addLayout(top)
+        layout.addWidget(current)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        members_card, members_box = card()
+        members_box.addWidget(label("Member images", "section"))
+        members_box.addWidget(label("One image file per selected host volume. A complete pool needs all members.", "muted", True))
+        self.members_table = table(["Image path", "Size", "State"])
+        self.members_table.setFixedHeight(220)
+        self.members_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.members_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.members_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.members_table.itemSelectionChanged.connect(self._refresh_size_editor)
+        members_box.addWidget(self.members_table)
+        size_frame = QFrame()
+        size_frame.setObjectName("metricCard")
+        size_box = QVBoxLayout(size_frame)
+        size_box.setContentsMargins(16, 14, 16, 14)
+        size_box.setSpacing(9)
+        size_heading = QHBoxLayout()
+        size_heading.addWidget(label("NEW IMAGE SIZE", "eyebrow"))
+        self.size_selected = label("Select a new image above", "muted")
+        self.size_selected.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.size_selected.setToolTip("Select a new image path to set its size")
+        size_heading.addWidget(self.size_selected, 1)
+        size_box.addLayout(size_heading)
+        size_controls = QHBoxLayout()
+        self.size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.size_slider.setObjectName("imageSizeSlider")
+        self.size_slider.setMinimumWidth(140)
+        self.size_slider.valueChanged.connect(self._size_slider_changed)
+        size_controls.addWidget(self.size_slider, 1)
+        self.size_input = QLineEdit()
+        self.size_input.setObjectName("imageSizeMiB")
+        self.size_input.setFixedWidth(112)
+        self.size_input.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.size_input.setValidator(QRegularExpressionValidator(QRegularExpression(r"[0-9]{0,13}")))
+        self.size_input.editingFinished.connect(self._size_input_finished)
+        self.size_input.setAccessibleName("Exact new image size in MiB")
+        size_controls.addWidget(self.size_input)
+        size_controls.addWidget(label("MiB", "muted"))
+        size_box.addLayout(size_controls)
+        self.size_maximum = label("Select a new member image to set its size.", "muted", True)
+        size_box.addWidget(self.size_maximum)
+        members_box.addWidget(size_frame)
+        controls = QHBoxLayout()
+        controls.addWidget(button("Add existing…", self.add_existing_image))
+        controls.addWidget(button("New image path…", self.add_new_image_path))
+        controls.addWidget(button("Remove", self.remove_selected_member))
+        controls.addStretch()
+        members_box.addLayout(controls)
+        members_box.addStretch(1)
+        columns.addWidget(members_card, 1)
+        side = QVBoxLayout()
+        side.setSpacing(16)
+        details, details_box = card()
+        details.setFixedWidth(302)
+        details_box.addWidget(label("Pool setup", "section"))
+        details_box.addWidget(label("POOL NAME", "micro"))
+        self.pool_name = QLineEdit(NEW_POOL_NAME)
+        self.pool_name.setMaxLength(32)
+        self.pool_name.setPlaceholderText("Name this pool")
+        self.pool_name.textChanged.connect(lambda _text: self._refresh_pool_identity())
+        details_box.addWidget(self.pool_name)
+        details_box.addWidget(label("MOUNT DRIVE", "micro"))
+        self.drive_combo = QComboBox()
+        self.drive_combo.addItems([f"{chr(code)}:" for code in range(ord("D"), ord("Z") + 1)])
+        self.drive_combo.setCurrentText("P:")
+        details_box.addWidget(self.drive_combo)
+        self.encrypt_check = QCheckBox("Encrypt new pool")
+        self.encrypt_check.setChecked(False)
+        details_box.addWidget(self.encrypt_check)
+        self.encryption_note = label(
+            "Unencrypted member images can be read without a password.", "muted", True
+        )
+        self.encryption_note.setStyleSheet("color:#efbd79;")
+        details_box.addWidget(self.encryption_note)
+        self.require_check = QCheckBox("Require encryption when mounting")
+        self.require_check.setChecked(False)
+        details_box.addWidget(self.require_check)
+        self.member_count = label("0 members", "muted")
+        details_box.addWidget(self.member_count)
+        side.addWidget(details)
+        next_card, next_box = card(accent=True)
+        next_box.addWidget(label("Create a new pool", "section"))
+        next_box.addWidget(label(
+            "Choose one or more formatted host volumes on Storage. "
+            "PoolFS will place a new image on each selected volume.", "muted", True
+        ))
+        next_box.addWidget(button("Choose host volumes  →", lambda: self._set_page("Storage"), True))
+        side.addWidget(next_card)
+        side.addStretch()
+        columns.addLayout(side)
+        actions, actions_box = card()
+        row = QHBoxLayout()
+        self.create_button = button("Create pool", self.create_pool, True)
+        self.grow_button = button("Grow images…", self.grow_images)
+        self.encrypt_check.toggled.connect(self._encryption_changed)
+        self.save_button = button("Save config…", self.save_config)
+        self.mount_button = button("Mount", self.mount_pool)
+        self.verify_button = button("Verify data", self.verify_pool)
+        self.unmount_button = button("Unmount", self.unmount_pool)
+        for item in (self.create_button, self.grow_button, self.save_button, self.mount_button,
+                     self.verify_button, self.unmount_button):
+            row.addWidget(item)
+        row.addStretch()
+        actions_box.addLayout(row)
+        layout.addWidget(actions)
+        layout.addLayout(columns, 1)
+        return self._scroll_page(content)
+
+    def _metric(self, title: str) -> tuple[QFrame, QLabel]:
+        frame = QFrame()
+        frame.setObjectName("metricCard")
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(18, 14, 18, 14)
+        box.addWidget(label(title, "micro"))
+        value = label("—", "metricValue")
+        box.addWidget(value)
+        return frame, value
+
+    def _build_storage_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("page")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 10, 5)
+        layout.setSpacing(16)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(label("Host partitions hold PoolFS image files. Disk layout tools are separate.", "muted", True), 1)
+        toolbar.addWidget(button("Refresh storage", self.refresh_inventory))
+        toolbar.addWidget(button("Run as admin", self.restart_as_admin))
+        layout.addLayout(toolbar)
+        metrics = QHBoxLayout()
+        metrics.setSpacing(12)
+        for title, attribute in (
+            ("PHYSICAL DISKS", "disk_count"),
+            ("PARTITIONS", "partition_count"),
+            ("FORMATTED HOST VOLUMES", "volume_count"),
+        ):
+            frame, value = self._metric(title)
+            setattr(self, attribute, value)
+            metrics.addWidget(frame, 1)
+        layout.addLayout(metrics)
+        lists = QHBoxLayout()
+        lists.setSpacing(16)
+        disk_card, disk_box = card()
+        disk_box.addWidget(label("Disks", "section"))
+        disk_box.addWidget(label("Select one to inspect its partitions.", "muted"))
+        self.disks_table = table(["Disk", "Size", "Layout", "Details"])
+        self.disks_table.setMinimumHeight(220)
+        self.disks_table.itemSelectionChanged.connect(self._selected_disk_changed)
+        disk_box.addWidget(self.disks_table)
+        lists.addWidget(disk_card, 1)
+        part_card, part_box = card()
+        part_box.addWidget(label("Partitions on selected disk", "section"))
+        self.partition_context = label("Choose a disk on the left.", "muted")
+        part_box.addWidget(self.partition_context)
+        self.partitions_table = table(["Part", "Drive", "File system", "Size", "Type / label"])
+        self.partitions_table.setMinimumHeight(220)
+        self.partitions_table.itemSelectionChanged.connect(self._update_partition_buttons)
+        part_box.addWidget(self.partitions_table)
+        lists.addWidget(part_card, 1)
+        layout.addLayout(lists)
+        partition_actions, partition_box = card()
+        partition_box.addWidget(label("Partition tools", "section"))
+        self.partition_notice = label(
+            "Changes require Administrator and all PoolFS drives unmounted. "
+            "The target is previewed and confirmed before any write.", "muted", True
+        )
+        partition_box.addWidget(self.partition_notice)
+        buttons = QHBoxLayout()
+        self.partition_buttons: dict[int, QPushButton] = {}
+        for action, title in (
+            (0, "Initialize GPT"), (1, "Create + format"), (2, "Quick format"),
+            (3, "Remove"), (4, "Change letter"),
+        ):
+            item = button(title, lambda action=action: self.partition_action(action))
+            item.setEnabled(False)
+            self.partition_buttons[action] = item
+            buttons.addWidget(item)
+        buttons.addStretch()
+        partition_box.addLayout(buttons)
+        layout.addWidget(partition_actions)
+        volumes_card, volumes_box = card()
+        header = QHBoxLayout()
+        description = QVBoxLayout()
+        description.addWidget(label("Host volumes", "section"))
+        description.addWidget(label(
+            "Tick each formatted volume that should hold a new member image.",
+            "muted", True
+        ))
+        header.addLayout(description, 1)
+        self.queue_button = button("Add selected volumes to pool", self.queue_volumes, True)
+        self.queue_button.setEnabled(False)
+        header.addWidget(self.queue_button)
+        volumes_box.addLayout(header)
+        self.volumes_table = table(["Use", "Mount path", "File system", "Free", "Disk / part", "Label"])
+        self.volumes_table.setMinimumHeight(225)
+        self.volumes_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.volumes_table.itemChanged.connect(self._volume_selection_changed)
+        self.volumes_table.cellClicked.connect(self._volume_cell_clicked)
+        volumes_box.addWidget(self.volumes_table)
+        self.volume_selection = label("No host volumes selected.", "muted")
+        volumes_box.addWidget(self.volume_selection)
+        layout.insertWidget(2, volumes_card)
+        return self._scroll_page(content)
+
+    def _build_images_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("page")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 10, 5)
+        layout.setSpacing(16)
+        intro, intro_box = card()
+        row = QHBoxLayout()
+        title = QVBoxLayout()
+        title.addWidget(label("Image files on this machine", "section"))
+        title.addWidget(label("Scans PoolFS folders on mounted host volumes without changing files.", "muted"))
+        row.addLayout(title, 1)
+        row.addWidget(button("Scan again", self.scan_images))
+        intro_box.addLayout(row)
+        layout.addWidget(intro)
+        image_card, image_box = card()
+        self.image_count = label("No scan yet", "muted")
+        image_box.addWidget(self.image_count)
+        self.images_table = table(["Image path", "Size", "Pool ID", "Member", "Encrypted"])
+        self.images_table.setMinimumHeight(390)
+        image_box.addWidget(self.images_table)
+        image_box.addWidget(button("Add selected image to Pool", self.add_scanned_image))
+        layout.addWidget(image_card)
+        layout.addStretch()
+        return self._scroll_page(content)
+
+    def _set_page(self, name: str) -> None:
+        pages = {"Pool": 0, "Storage": 1, "Images": 2}
+        self.pages.setCurrentIndex(pages[name])
+        page = self.pages.widget(pages[name])
+        if isinstance(page, QScrollArea):
+            QTimer.singleShot(0, lambda: page.verticalScrollBar().setValue(0))
+        self.page_title.setText(name)
+        subtitles = {
+            "Pool": "Create a pool or open an existing config.",
+            "Storage": "Choose host volumes for images, or inspect your disks.",
+            "Images": "Find existing PoolFS member images on this machine.",
+        }
+        self.page_subtitle.setText(subtitles[name])
+        for title, control in self.nav.items():
+            control.setChecked(title == name)
+        if name == "Images" and not self._images_scanned:
+            self.scan_images()
+
+    def _message(self, text: str) -> None:
+        self.status.setText(text)
+
+    def _refresh_pool_identity(self) -> None:
+        if not hasattr(self, "config_name"):
+            return
+        if self.config_path or self.members:
+            self.config_name.setText(self.pool_name.text() or "Unnamed pool")
+            self.config_location.setText(
+                self.config_path or "Unsaved pool draft · choose host volumes and create images."
+            )
+        else:
+            self.config_name.setText("No pool selected")
+            self.config_location.setText(
+                "Open a JSON config or select host volumes to start a new pool."
+            )
+
+    def _encryption_changed(self, encrypted: bool) -> None:
+        self.create_button.setText("Create encrypted pool" if encrypted else "Create pool")
+        if not self.members or all(member.get("planned") for member in self.members):
+            self.require_check.setChecked(encrypted)
+        self.encryption_note.setText(
+            "A password will be required to unlock these images."
+            if encrypted else "Unencrypted member images can be read without a password."
+        )
+        self.encryption_note.setStyleSheet(
+            "color:#9db0c9;" if encrypted else "color:#efbd79;"
+        )
+
+    def _error(self, text: str) -> None:
+        self._message(text)
+        QMessageBox.critical(self, "PoolFS Manager", text)
+
+    def _run(self, work: Callable[[], Any], complete: Callable[[Any], None]) -> None:
+        worker = Task(work, self)
+        self._tasks.add(worker)
+        worker.result.connect(complete)
+        worker.failed.connect(self._error)
+        worker.finished.connect(lambda: self._tasks.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _run_operation(
+        self, activity: str, work: Callable[[], Any],
+        complete: Callable[[Any], None],
+        failure: Callable[[str], None] | None = None,
+    ) -> None:
+        if self._running_operation:
+            self._message("Wait for the current PoolFS operation to finish.")
+            return
+        self._running_operation = True
+        self.centralWidget().setEnabled(False)
+        self._message(activity)
+
+        def finish() -> None:
+            self._running_operation = False
+            self.centralWidget().setEnabled(True)
+
+        def succeeded(result: Any) -> None:
+            finish()
+            complete(result)
+
+        def failed(message: str) -> None:
+            finish()
+            if failure is None:
+                self._error(message)
+            else:
+                failure(message)
+
+        worker = Task(work, self)
+        self._tasks.add(worker)
+        worker.result.connect(succeeded)
+        worker.failed.connect(failed)
+        worker.finished.connect(lambda: self._tasks.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def closeEvent(self, event: Any) -> None:
+        if self._tasks:
+            event.ignore()
+            self._message("Wait for the current PoolFS operation to finish before closing.")
+            return
+        super().closeEvent(event)
+
+    def load_inventory_sync(self) -> None:
+        if self.backend is None:
+            self._message("Native PoolFS bridge is unavailable.")
+            return
+        try:
+            self._on_inventory(self.backend.inventory())
+        except Exception as exc:
+            self._message(str(exc))
+
+    def refresh_inventory(self) -> None:
+        if self.backend is None:
+            self._message("Native PoolFS bridge is unavailable.")
+            return
+        self._message("Reading physical disks and host volumes…")
+        self._run(self.backend.inventory, self._on_inventory)
+
+    @staticmethod
+    def _put(widget: QTableWidget, row: int, column: int, text: str, data: Any = None) -> None:
+        item = QTableWidgetItem(text)
+        if data is not None:
+            item.setData(Qt.ItemDataRole.UserRole, data)
+        widget.setItem(row, column, item)
+
+    def _on_inventory(self, data: dict[str, Any]) -> None:
+        self.inventory = data
+        disks = data.get("disks", [])
+        volumes = data.get("volumes", [])
+        self.host_volumes = [
+            volume for volume in volumes
+            if any(len(path) >= 3 and path[1:3] == ":\\"
+                   for path in volume.get("mountPaths") or [])
+            and volume.get("diskNumber") is not None
+            and volume.get("partitionNumber") is not None
+        ]
+        self.disk_count.setText(str(len(disks)))
+        self.partition_count.setText(str(sum(len(d.get("partitions", [])) for d in disks)))
+        self.volume_count.setText(str(sum(bool(v.get("filesystem")) for v in self.host_volumes)))
+        self.disks_table.setRowCount(len(disks))
+        for row, disk in enumerate(disks):
+            self._put(self.disks_table, row, 0, f"Disk {disk.get('number', '?')}", row)
+            self._put(self.disks_table, row, 1, human_size(disk.get("totalBytes")))
+            self._put(self.disks_table, row, 2,
+                      {0: "MBR", 1: "GPT", 2: "RAW"}.get(disk.get("partitionStyle"), "Unknown"))
+            self._put(self.disks_table, row, 3, str(disk.get("diskGuid") or disk.get("queryError") or ""))
+            self.disks_table.setRowHeight(row, 40)
+        self.partitions_table.setRowCount(0)
+        self.partition_context.setText("Choose a disk on the left.")
+        self.volumes_table.blockSignals(True)
+        self.volumes_table.setRowCount(len(self.host_volumes))
+        for row, volume in enumerate(self.host_volumes):
+            paths = volume.get("mountPaths") or []
+            mount = next((p for p in paths if len(p) >= 2 and p[1] == ":"), None)
+            mount = mount or (paths[0] if paths else "(no mount path)")
+            filesystem = str(volume.get("filesystem") or "Unformatted")
+            location = (
+                f"Disk {volume['diskNumber']} / Part {volume['partitionNumber']}"
+                if volume.get("diskNumber") is not None and volume.get("partitionNumber") is not None
+                else "Unknown"
+            )
+            check = QTableWidgetItem()
+            selectable = bool(volume.get("filesystem")) and (volume.get("freeBytes") or 0) >= 384 * MIB
+            check.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable |
+                (Qt.ItemFlag.ItemIsEnabled if selectable else Qt.ItemFlag(0))
+            )
+            check.setCheckState(Qt.CheckState.Unchecked)
+            check.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if not selectable:
+                check.setToolTip("Format this partition or free at least 384 MiB to use it.")
+            self.volumes_table.setItem(row, 0, check)
+            self._put(self.volumes_table, row, 1, mount, row)
+            self._put(self.volumes_table, row, 2, filesystem)
+            self._put(self.volumes_table, row, 3, human_size(volume.get("freeBytes")))
+            self._put(self.volumes_table, row, 4, location)
+            self._put(self.volumes_table, row, 5, str(volume.get("label") or ""))
+            self.volumes_table.setRowHeight(row, 38)
+        self.volumes_table.blockSignals(False)
+        self.volume_selection.setText("No host volumes selected.")
+        self.queue_button.setEnabled(False)
+        self._update_partition_buttons()
+        self._message(f"Ready · {len(disks)} disks · {len(volumes)} volumes")
+
+    def _selected_disk(self) -> dict[str, Any] | None:
+        row = self.disks_table.currentRow()
+        disks = self.inventory.get("disks", [])
+        if row < 0 or row >= len(disks):
+            return None
+        return disks[row]
+
+    def _selected_partition(self) -> dict[str, Any] | None:
+        disk = self._selected_disk()
+        row = self.partitions_table.currentRow()
+        if disk is None or row < 0:
+            return None
+        parts = disk.get("partitions", [])
+        return parts[row] if row < len(parts) else None
+
+    def _volume_for_part(self, disk_number: int, part_number: int) -> dict[str, Any] | None:
+        return next(
+            (v for v in self.inventory.get("volumes", [])
+             if v.get("diskNumber") == disk_number and v.get("partitionNumber") == part_number),
+            None,
+        )
+
+    def _selected_disk_changed(self) -> None:
+        disk = self._selected_disk()
+        if disk is None:
+            self.partitions_table.setRowCount(0)
+            self.partition_context.setText("Choose a disk on the left.")
+            self._update_partition_buttons()
+            return
+        self.partition_context.setText(f"Disk {disk.get('number')} · select a partition for partition tools.")
+        parts = disk.get("partitions", [])
+        self.partitions_table.setRowCount(len(parts))
+        for row, part in enumerate(parts):
+            volume = self._volume_for_part(disk["number"], part["number"])
+            paths = volume.get("mountPaths") or [] if volume else []
+            drive = next((p[:2] for p in paths if len(p) >= 2 and p[1] == ":"), "—")
+            self._put(self.partitions_table, row, 0, str(part.get("number", "?")), row)
+            self._put(self.partitions_table, row, 1, drive)
+            self._put(self.partitions_table, row, 2,
+                      str(volume.get("filesystem") or "Unformatted") if volume else "—")
+            self._put(self.partitions_table, row, 3, human_size(part.get("lengthBytes")))
+            self._put(self.partitions_table, row, 4,
+                      str((volume or {}).get("label") or part.get("name") or part.get("type") or ""))
+            self.partitions_table.setRowHeight(row, 38)
+        self._update_partition_buttons()
+
+    def _checked_volume_rows(self) -> list[int]:
+        return [
+            row for row in range(self.volumes_table.rowCount())
+            if self.volumes_table.item(row, 0).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _volume_cell_clicked(self, row: int, column: int) -> None:
+        if column != 0:
+            item = self.volumes_table.item(row, 0)
+            if not item.flags() & Qt.ItemFlag.ItemIsEnabled:
+                return
+            item.setCheckState(
+                Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+
+    def _volume_selection_changed(self) -> None:
+        rows = self._checked_volume_rows()
+        self.queue_button.setEnabled(bool(rows))
+        self.volume_selection.setText(
+            f"{len(rows)} host volume{'s' if len(rows) != 1 else ''} selected. "
+            "One new image will be queued on each."
+            if rows else "No host volumes selected."
+        )
+
+    def _member_host(self, member: dict[str, Any]) -> tuple[str, str, str]:
+        """Return the host root, stable volume identity, and host filesystem."""
+        if member.get("hostRoot"):
+            root = str(member["hostRoot"])
+            return root, str(member.get("hostGuid") or root).casefold(), str(member.get("hostFilesystem") or "")
+        path = Path(str(member["path"]))
+        if not path.is_absolute():
+            raise OSError(f"Use an absolute image path: {path}")
+        ancestor = path.parent
+        while not ancestor.exists() and ancestor != ancestor.parent:
+            ancestor = ancestor.parent
+        if not ancestor.exists():
+            raise OSError(f"The host volume for {path} is unavailable.")
+        ancestor = ancestor.resolve()
+        if os.name != "nt":
+            root = str(ancestor.anchor)
+            return root, root.casefold(), ""
+        kernel32 = ctypes.windll.kernel32
+        root_buffer = ctypes.create_unicode_buffer(32768)
+        get_root = kernel32.GetVolumePathNameW
+        get_root.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        get_root.restype = ctypes.c_int
+        if not get_root(str(ancestor), root_buffer, len(root_buffer)):
+            raise OSError(f"Could not identify the host volume for {path}.")
+        root = root_buffer.value
+        guid_buffer = ctypes.create_unicode_buffer(128)
+        get_guid = kernel32.GetVolumeNameForVolumeMountPointW
+        get_guid.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        get_guid.restype = ctypes.c_int
+        key = guid_buffer.value if get_guid(root, guid_buffer, len(guid_buffer)) else root
+        filesystem_buffer = ctypes.create_unicode_buffer(64)
+        get_filesystem = kernel32.GetVolumeInformationW
+        get_filesystem.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_wchar_p, ctypes.c_uint32,
+        ]
+        get_filesystem.restype = ctypes.c_int
+        if not get_filesystem(root, None, 0, None, None, None,
+                              filesystem_buffer, len(filesystem_buffer)):
+            raise OSError(f"Could not read the host filesystem for {path}.")
+        return root, key.casefold(), filesystem_buffer.value
+
+    def _size_limit_for_member(self, row: int) -> int:
+        member = self.members[row]
+        root, key, filesystem = self._member_host(member)
+        other_mib = sum(
+            int(other.get("sizeMiB", MIN_IMAGE_MIB))
+            for index, other in enumerate(self.members)
+            if index != row and other.get("planned") and self._member_host(other)[1] == key
+        )
+        free_mib = shutil.disk_usage(root).free // MIB
+        maximum = min(MAX_IMAGE_MIB, free_mib - other_mib)
+        if filesystem.upper() == "FAT32":
+            maximum = min(maximum, 0xFFFFFFFF // MIB)
+        return maximum
+
+    def _planned_sizes_fit(self) -> bool:
+        requested: dict[str, tuple[str, int]] = {}
+        try:
+            for member in self.members:
+                if not member.get("planned"):
+                    continue
+                root, key, filesystem = self._member_host(member)
+                size_mib = int(member.get("sizeMiB", 0))
+                if size_mib < MIN_IMAGE_MIB or size_mib > MAX_IMAGE_MIB:
+                    return False
+                if filesystem.upper() == "FAT32" and size_mib > 0xFFFFFFFF // MIB:
+                    return False
+                old = requested.get(key, (root, 0))[1]
+                requested[key] = root, old + size_mib
+            return all(shutil.disk_usage(root).free // MIB >= total
+                       for root, total in requested.values())
+        except (OSError, ValueError):
+            return False
+
+    def _refresh_create_button(self) -> None:
+        planned = [member for member in self.members if member.get("planned")]
+        self.create_button.setEnabled(
+            bool(planned) and len(planned) == len(self.members) and
+            not any(Path(str(member["path"])).exists() for member in planned) and
+            self._planned_sizes_fit()
+        )
+
+    def _slider_value_for_size(self, size_mib: int, maximum: int) -> int:
+        if maximum <= 2_147_483_647:
+            return max(MIN_IMAGE_MIB, min(size_mib, maximum))
+        return max(0, min(MAX_SLIDER_STEPS,
+                          (size_mib - MIN_IMAGE_MIB) * MAX_SLIDER_STEPS //
+                          (maximum - MIN_IMAGE_MIB)))
+
+    def _size_for_slider_value(self, value: int, maximum: int) -> int:
+        if maximum <= 2_147_483_647:
+            return value
+        return MIN_IMAGE_MIB + (
+            value * (maximum - MIN_IMAGE_MIB) + MAX_SLIDER_STEPS // 2
+        ) // MAX_SLIDER_STEPS
+
+    def _refresh_size_editor(self) -> None:
+        row = self.members_table.currentRow()
+        old_row = getattr(self, "_size_edit_row", None)
+        old_member = getattr(self, "_size_edit_member", None)
+        if (old_row != row and self.size_input.isModified() and
+                old_row is not None and 0 <= old_row < len(self.members) and
+                self.members[old_row] is old_member):
+            self.size_input.setModified(False)
+            self._commit_size_input(old_row)
+        self._size_edit_row = row
+        self._size_edit_member = self.members[row] if 0 <= row < len(self.members) else None
+        self._displayed_size_maximum = None
+        self.size_slider.blockSignals(True)
+        self.size_input.blockSignals(True)
+        try:
+            if not 0 <= row < len(self.members) or not self.members[row].get("planned"):
+                self.size_selected.setText("Select a new image above")
+                self.size_slider.setEnabled(False)
+                self.size_input.setEnabled(False)
+                self.size_input.clear()
+                self.size_maximum.setText("Select a new member image to set its size.")
+                return
+            member = self.members[row]
+            self.size_selected.setText(Path(str(member["path"])).name)
+            self.size_selected.setToolTip(str(member["path"]))
+            size_mib = int(member.get("sizeMiB", MIN_IMAGE_MIB))
+            self.size_input.setText(str(size_mib))
+            try:
+                maximum = self._size_limit_for_member(row)
+            except OSError as exc:
+                self.size_slider.setEnabled(False)
+                self.size_input.setEnabled(False)
+                self.size_maximum.setText(f"Free space unavailable: {exc}")
+                return
+            if maximum < MIN_IMAGE_MIB:
+                self.size_slider.setEnabled(False)
+                self.size_input.setEnabled(False)
+                self.size_maximum.setText(
+                    f"Only {max(0, maximum):,} MiB available after other images. "
+                    f"Free up space or remove another image (minimum {MIN_IMAGE_MIB} MiB)."
+                )
+                return
+            self._displayed_size_maximum = maximum
+            self.size_slider.setEnabled(True)
+            self.size_input.setEnabled(True)
+            self.size_slider.setRange(
+                MIN_IMAGE_MIB if maximum <= 2_147_483_647 else 0,
+                maximum if maximum <= 2_147_483_647 else MAX_SLIDER_STEPS,
+            )
+            self.size_slider.setValue(self._slider_value_for_size(size_mib, maximum))
+            self.size_maximum.setText(
+                f"Minimum {MIN_IMAGE_MIB} MiB · Maximum available here: "
+                f"{maximum:,} MiB ({human_size(maximum * MIB)})."
+                + (" Current size exceeds available space." if size_mib > maximum else "")
+            )
+        finally:
+            self.size_slider.blockSignals(False)
+            self.size_input.blockSignals(False)
+
+    def _set_member_size(self, row: int, size_mib: int, maximum: int) -> None:
+        self.members[row]["sizeMiB"] = size_mib
+        item = self.members_table.item(row, 1)
+        if item is not None:
+            item.setText(f"{size_mib:,} MiB")
+        self.size_input.setText(str(size_mib))
+        self.size_slider.blockSignals(True)
+        try:
+            self.size_slider.setValue(self._slider_value_for_size(size_mib, maximum))
+        finally:
+            self.size_slider.blockSignals(False)
+        self._size_validation_timer.start(120)
+
+    def _size_slider_changed(self, value: int) -> None:
+        row = self.members_table.currentRow()
+        if not 0 <= row < len(self.members) or not self.members[row].get("planned"):
+            return
+        try:
+            maximum = self._size_limit_for_member(row)
+        except OSError:
+            self._refresh_size_editor()
+            self._refresh_create_button()
+            return
+        if maximum < MIN_IMAGE_MIB:
+            self._refresh_size_editor()
+            self._refresh_create_button()
+            return
+        if maximum != getattr(self, "_displayed_size_maximum", maximum):
+            self._refresh_size_editor()
+            return
+        size_mib = max(MIN_IMAGE_MIB, min(self._size_for_slider_value(value, maximum), maximum))
+        self._set_member_size(row, size_mib, maximum)
+
+    def _size_input_finished(self) -> None:
+        row = getattr(self, "_size_edit_row", None)
+        if row is None or not 0 <= row < len(self.members):
+            return
+        if self.members[row] is not getattr(self, "_size_edit_member", None):
+            return
+        self._commit_size_input(row)
+
+    def _commit_size_input(self, row: int) -> None:
+        if not self.members[row].get("planned"):
+            return
+        try:
+            maximum = self._size_limit_for_member(row)
+        except OSError:
+            self._refresh_size_editor()
+            self._refresh_create_button()
+            return
+        if maximum < MIN_IMAGE_MIB:
+            self._refresh_size_editor()
+            self._refresh_create_button()
+            return
+        try:
+            requested = int(self.size_input.text())
+        except ValueError:
+            self._refresh_size_editor()
+            return
+        size_mib = max(MIN_IMAGE_MIB, min(requested, maximum))
+        self._set_member_size(row, size_mib, maximum)
+        if requested != size_mib:
+            self._message(f"Image size adjusted to the available range: {size_mib:,} MiB.")
+
+    def _refresh_members(self) -> None:
+        selected_row = self.members_table.currentRow()
+        self.members_table.blockSignals(True)
+        self.members_table.setRowCount(len(self.members))
+        for row, member in enumerate(self.members):
+            path = str(member["path"])
+            self._put(self.members_table, row, 0, path, row)
+            if member.get("planned"):
+                self._put(self.members_table, row, 1,
+                          f"{int(member.get('sizeMiB', MIN_IMAGE_MIB)):,} MiB")
+            else:
+                self._put(self.members_table, row, 1, human_size(Path(path).stat().st_size)
+                          if Path(path).is_file() else "Missing")
+            self._put(self.members_table, row, 2,
+                      "Created during failed format" if member.get("partial") else
+                      "New path" if member.get("planned") else
+                      "Present" if Path(path).is_file() else "Missing")
+            self.members_table.setRowHeight(row, 43)
+        if self.members:
+            if not 0 <= selected_row < len(self.members):
+                selected_row = next((i for i, m in enumerate(self.members)
+                                     if m.get("planned")), 0)
+            self.members_table.selectRow(selected_row)
+        self.members_table.blockSignals(False)
+        self._refresh_size_editor()
+        self.member_count.setText(f"{len(self.members)} of 16 member images")
+        self._refresh_pool_identity()
+        planned = [m for m in self.members if m.get("planned")]
+        existing = len(self.members) - len(planned)
+        self.encrypt_check.setVisible(not existing)
+        if existing:
+            self.encryption_note.setText(
+                "Existing member images keep their current encryption state."
+            )
+            self.encryption_note.setStyleSheet("color:#9db0c9;")
+        else:
+            self.encryption_note.setText(
+                "A password will be required to unlock these images."
+                if self.encrypt_check.isChecked()
+                else "Unencrypted member images can be read without a password."
+            )
+            self.encryption_note.setStyleSheet(
+                "color:#9db0c9;" if self.encrypt_check.isChecked()
+                else "color:#efbd79;"
+            )
+        self.require_check.setEnabled(not planned)
+        self._refresh_create_button()
+        self.grow_button.setEnabled(bool(self.config_path) and bool(self.members) and not planned)
+        for item in (self.save_button, self.mount_button, self.verify_button):
+            item.setEnabled(bool(self.members) and not planned)
+
+    def _same_mount(self, path: str, expected: str) -> bool:
+        if os.name != "nt":
+            return False
+        buffer = ctypes.create_unicode_buffer(128)
+        get_volume_name = ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW
+        get_volume_name.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        get_volume_name.restype = ctypes.c_int
+        ok = get_volume_name(
+            ctypes.c_wchar_p(path), buffer, len(buffer)
+        )
+        return bool(ok) and buffer.value.casefold() == expected.casefold()
+
+    def queue_volumes(self) -> None:
+        rows = self._checked_volume_rows()
+        if not rows:
+            return
+        selected = [self.host_volumes[row] for row in rows]
+        existing = self.config_path or any(not m.get("planned") for m in self.members)
+        if existing:
+            answer = QMessageBox.question(
+                self, "Start a new pool",
+                "PoolFS cannot add members to an existing formatted pool. "
+                "Start a separate new pool with the selected volumes? "
+                "Existing image files and saved configs stay intact."
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        current_members = [] if existing else self.members
+        if len(current_members) + len(selected) > 16:
+            self._error("A PoolFS pool supports at most 16 member images.")
+            return
+        planned: list[dict[str, Any]] = []
+        for volume in selected:
+            if volume.get("diskNumber") is None or volume.get("partitionNumber") is None:
+                self._error("Select a physical host volume; PoolFS virtual volumes cannot host a member image.")
+                return
+            if not volume.get("filesystem"):
+                self._error("A selected host partition is unformatted. Format it before adding an image.")
+                return
+            paths = volume.get("mountPaths") or []
+            root = next((p for p in paths if len(p) >= 3 and p[1:3] == ":\\"), None)
+            if root is None:
+                self._error("A selected host volume needs a drive letter before it can hold an image.")
+                return
+            if not self._same_mount(root, volume.get("guidPath") or ""):
+                self._error("A selected volume changed. Refresh Storage and choose it again.")
+                return
+            try:
+                reserved = sum(
+                    int(member.get("sizeMiB", MIN_IMAGE_MIB))
+                    for member in [*current_members, *planned]
+                    if member.get("planned") and
+                    self._member_host(member)[1] == str(volume["guidPath"]).casefold()
+                )
+                available_mib = shutil.disk_usage(root).free // MIB - reserved
+            except OSError as exc:
+                self._error(f"Could not read host free space: {exc}")
+                return
+            if available_mib < MIN_IMAGE_MIB:
+                self._error("A selected volume needs at least 384 MiB free after its other planned images.")
+                return
+            folder = Path(root) / "PoolFS"
+            candidate = None
+            for number in range(1, 10001):
+                option = folder / f"member-{number}.img"
+                if not option.exists() and all(
+                    str(m["path"]).casefold() != str(option).casefold()
+                    for m in [*current_members, *planned]
+                ):
+                    candidate = option
+                    break
+            if candidate is None:
+                self._error("Could not find an unused member image name.")
+                return
+            planned.append({
+                "path": str(candidate), "sizeMiB": 384, "planned": True,
+                "hostRoot": root, "hostGuid": volume["guidPath"],
+                "hostFilesystem": volume["filesystem"],
+            })
+        if existing:
+            self.members.clear()
+            self.config = None
+            self.config_path = None
+            self.pool_name.setText(NEW_POOL_NAME)
+            self.encrypt_check.setChecked(False)
+            self.require_check.setChecked(False)
+        self.members.extend(planned)
+        for row in rows:
+            self.volumes_table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)
+        self._refresh_members()
+        self.members_table.selectRow(len(self.members) - len(planned))
+        self._set_page("Pool")
+        self._message(f"Queued {len(planned)} new image path(s). Set sizes, then create the pool.")
+
+    def new_pool(self) -> None:
+        if self.members:
+            answer = QMessageBox.question(
+                self, "New pool", "Clear the current draft? "
+                "No existing image file or saved config will be deleted."
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.members.clear()
+        self.config = None
+        self.config_path = None
+        self.drive_combo.setCurrentText("P:")
+        self.pool_name.setText(NEW_POOL_NAME)
+        self.encrypt_check.setChecked(False)
+        self.require_check.setChecked(False)
+        self._refresh_members()
+        self._message("Started a new pool draft.")
+
+    def open_config(self) -> None:
+        if self.backend is None:
+            self._error("Native PoolFS bridge is unavailable.")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open PoolFS config", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            config = self.backend.load_config(path)
+            self.config = config
+            self.config_path = path
+            self.members = [
+                {"path": member, "planned": False}
+                for member in config.get("members", [])
+            ]
+            self.pool_name.setText(str(config.get("name") or "PoolFS"))
+            self.drive_combo.setCurrentText(str(config["drive"]))
+            self.require_check.setChecked(bool(config.get("requireEncrypted", True)))
+            self._refresh_members()
+            self._set_page("Pool")
+            self._message(f"Opened {Path(path).name}")
+        except Exception as exc:
+            self._error(str(exc))
+
+    def add_existing_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Select PoolFS image", "", "Images (*.img);;All files (*)")
+        if path:
+            if any(str(m["path"]).casefold() == path.casefold() for m in self.members):
+                self._error("This image is already in the member list.")
+                return
+            if len(self.members) >= 16:
+                self._error("A pool supports at most 16 images.")
+                return
+            self.members.append({"path": path, "planned": False})
+            self._refresh_members()
+
+    def add_new_image_path(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Choose new image path", "", "Images (*.img)")
+        if path:
+            if Path(path).exists():
+                self._error("A new member image path must not exist yet.")
+                return
+            if any(str(m["path"]).casefold() == path.casefold() for m in self.members):
+                self._error("This image path is already in the member list.")
+                return
+            if len(self.members) >= 16:
+                self._error("A pool supports at most 16 images.")
+                return
+            self.members.append({"path": path, "sizeMiB": 384, "planned": True})
+            self._refresh_members()
+            self.members_table.selectRow(len(self.members) - 1)
+
+    def remove_selected_member(self) -> None:
+        row = self.members_table.currentRow()
+        if 0 <= row < len(self.members):
+            self.members.pop(row)
+            self._refresh_members()
+
+    def add_scanned_image(self) -> None:
+        row = self.images_table.currentRow()
+        if 0 <= row < len(self.images):
+            image = self.images[row]
+            path = str(image["path"])
+            if not any(str(m["path"]).casefold() == path.casefold() for m in self.members):
+                if len(self.members) >= 16:
+                    self._error("A pool supports at most 16 images.")
+                    return
+                self.members.append({"path": path, "planned": False})
+                self._refresh_members()
+            self._set_page("Pool")
+
+    def scan_images(self) -> None:
+        if self.backend is None:
+            return
+        self._message("Scanning PoolFS folders…")
+        self._run(self.backend.scan_images, self._on_images)
+
+    def _on_images(self, result: dict[str, Any]) -> None:
+        self._images_scanned = True
+        self.images = result.get("images", [])
+        self.images_table.setRowCount(len(self.images))
+        for row, image in enumerate(self.images):
+            self._put(self.images_table, row, 0, str(image.get("path", "")), row)
+            self._put(self.images_table, row, 1, human_size(image.get("bytes")))
+            self._put(self.images_table, row, 2, str(image.get("poolId", "")))
+            self._put(self.images_table, row, 3,
+                      f"{int(image.get('memberIndex', 0)) + 1} of {image.get('memberCount', '?')}")
+            self._put(self.images_table, row, 4, "Yes" if image.get("encrypted") else "No")
+            self.images_table.setRowHeight(row, 39)
+        self.image_count.setText(f"{len(self.images)} member image(s) found")
+        self._message(f"Image scan complete · {len(self.images)} found")
+
+    def _password(self, title: str, confirm: bool = False) -> str | None:
+        dialog = PasswordDialog(self, title, confirm)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            dialog.first.clear()
+            if dialog.second is not None:
+                dialog.second.clear()
+            return None
+        return dialog.take_password()
+
+    def _call_sync(self, activity: str, action: Callable[[], Any]) -> Any | None:
+        self._message(activity)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            return action()
+        except Exception as exc:
+            self._error(str(exc))
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def create_pool(self) -> None:
+        if self.backend is None:
+            self._error("Native PoolFS bridge is unavailable.")
+            return
+        try:
+            name = validate_pool_name(self.pool_name.text())
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        if not self.members or any(not m.get("planned") for m in self.members):
+            self._error("Create pool needs only new image paths. Start a new pool for existing images.")
+            return
+        if len(self.members) > 16:
+            self._error("A pool supports at most 16 images.")
+            return
+        requested_by_host: dict[str, tuple[str, int]] = {}
+        try:
+            for member in self.members:
+                path = Path(str(member["path"]))
+                if path.exists():
+                    self._error(f"New image path already exists: {path}")
+                    return
+                size_mib = int(member.get("sizeMiB", 0))
+                if size_mib < MIN_IMAGE_MIB:
+                    self._error("Each member image must be at least 384 MiB.")
+                    return
+                if size_mib > MAX_IMAGE_MIB:
+                    self._error("The member image exceeds the PoolFS format size limit.")
+                    return
+                root, host_key, filesystem = self._member_host(member)
+                if member.get("hostRoot"):
+                    if not self._same_mount(root, str(member["hostGuid"])):
+                        self._error("A selected host volume changed. Refresh Storage and select it again.")
+                        return
+                if filesystem.upper() == "FAT32" and size_mib > 0xFFFFFFFF // MIB:
+                    self._error("A FAT32 host volume cannot hold this image size.")
+                    return
+                previous = requested_by_host.get(host_key, (root, 0))[1]
+                requested_by_host[host_key] = (root, previous + size_mib * MIB)
+            for root, requested_bytes in requested_by_host.values():
+                if shutil.disk_usage(root).free < requested_bytes:
+                    self._error(
+                        f"Not enough free space on {root} for the planned images "
+                        f"({human_size(requested_bytes)} requested)."
+                    )
+                    return
+        except OSError as exc:
+            self._error(f"Could not validate free space: {exc}")
+            return
+        total = sum(int(m["sizeMiB"]) for m in self.members)
+        encrypted = self.encrypt_check.isChecked()
+        mode = "encrypted" if encrypted else "unencrypted"
+        warning = (
+            "\n\nThese images will be readable without a password."
+            if not encrypted else ""
+        )
+        if QMessageBox.question(
+            self, "Create PoolFS pool",
+            f"Create {name} with {len(self.members)} new {mode} image(s), "
+            f"totaling {total:,} MiB? Existing files will not be overwritten."
+            + warning
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        password = self._password("Create encrypted pool", True) if encrypted else None
+        if encrypted and password is None:
+            return
+        planned_members = [dict(member) for member in self.members]
+        specs = [(str(m["path"]), int(m["sizeMiB"]) * MIB) for m in planned_members]
+        backend = self.backend
+        secret_holder = [password]
+        password = None
+
+        def work() -> dict[str, Any]:
+            try:
+                for member in planned_members:
+                    folder = Path(str(member["path"])).parent
+                    if member.get("hostRoot") and (folder.is_junction() or folder.is_symlink()):
+                        raise RuntimeError(f"PoolFS folder is a junction or link: {folder}")
+                    folder.mkdir(parents=True, exist_ok=True)
+                    if member.get("hostRoot") and (
+                        folder.is_junction() or folder.is_symlink() or
+                        not self._same_mount(str(member["hostRoot"]), str(member["hostGuid"]))
+                    ):
+                        raise RuntimeError("A selected host folder or volume changed before formatting.")
+                return backend.format_v6(specs, secret_holder[0])
+            finally:
+                secret_holder[0] = None
+
+        def failed(message: str) -> None:
+            created = []
+            for member in self.members:
+                if Path(str(member["path"])).exists():
+                    member["partial"] = True
+                    created.append(str(member["path"]))
+            if created:
+                self._refresh_members()
+                warning = (
+                    f"{message}\n\nFormatting stopped after one or more image paths were created. "
+                    "The listed files have been left in place for inspection. "
+                    "Do not mount them as a complete pool.\n\n" + "\n".join(created)
+                )
+                self._message("Pool creation incomplete; inspect the created image paths.")
+                QMessageBox.warning(self, "Pool creation incomplete", warning)
+            else:
+                self._error(message)
+
+        def completed(result: dict[str, Any]) -> None:
+            for member in self.members:
+                member["planned"] = False
+            self.config = None
+            self.config_path = None
+            self.require_check.setChecked(encrypted)
+            self._refresh_members()
+            self._message(f"Created {name} with {len(self.members)} image(s). Save its config.")
+            QMessageBox.information(
+                self, "Pool created",
+                "The member images were created. Save a JSON config to mount or transport this pool."
+            )
+            self.save_config()
+
+        self._run_operation("Creating PoolFS images…", work, completed, failed)
+
+    def grow_images(self) -> None:
+        config = self._current_config()
+        if config is None or self.backend is None:
+            return
+        sources = [Path(str(member["path"])) for member in self.members]
+        if not sources or any(not source.is_file() for source in sources):
+            self._error("Every member image must be present before expansion.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Expand PoolFS images")
+        dialog.setMinimumWidth(800)
+        box = QVBoxLayout(dialog)
+        box.setContentsMargins(22, 20, 22, 18)
+        box.addWidget(label("Expand one or more members", "section"))
+        box.addWidget(label(
+            "Enter the new size for each member. PoolFS creates verified copies "
+            "beside the originals; every member needs a new copy because the "
+            "size manifest is shared. Original images stay intact.", "muted", True
+        ))
+        sizes = table(["Existing member", "Current", "New size (MiB)"])
+        sizes.setRowCount(len(sources))
+        sizes.setMinimumHeight(min(500, 55 + len(sources) * 43))
+        sizes.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        inputs: list[QLineEdit] = []
+        for row, source in enumerate(sources):
+            current_mib = source.stat().st_size // MIB
+            self._put(sizes, row, 0, str(source))
+            self._put(sizes, row, 1, f"{current_mib:,} MiB")
+            field = QLineEdit(str(current_mib))
+            field.setValidator(QRegularExpressionValidator(QRegularExpression(r"[0-9]{0,13}")))
+            field.setAccessibleName(f"New size in MiB for {source.name}")
+            sizes.setCellWidget(row, 2, field)
+            sizes.setRowHeight(row, 43)
+            inputs.append(field)
+        box.addWidget(sizes)
+        controls = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        controls.accepted.connect(dialog.accept)
+        controls.rejected.connect(dialog.reject)
+        box.addWidget(controls)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        specs: list[tuple[str, str, int]] = []
+        taken = {str(source).casefold() for source in sources}
+        growing = False
+        requested_by_host: dict[str, tuple[str, int]] = {}
+        try:
+            for source, field in zip(sources, inputs):
+                current_mib = source.stat().st_size // MIB
+                requested_mib = int(field.text())
+                if not current_mib * MIB == source.stat().st_size:
+                    raise ValueError(f"Member length is not MiB-aligned: {source}")
+                if not current_mib <= requested_mib <= MAX_IMAGE_MIB:
+                    raise ValueError(f"New size for {source.name} must be at least {current_mib:,} MiB.")
+                growing |= requested_mib > current_mib
+                for number in range(1, 10001):
+                    suffix = "-grown" if number == 1 else f"-grown-{number}"
+                    destination = source.with_name(f"{source.stem}{suffix}{source.suffix}")
+                    if not destination.exists() and str(destination).casefold() not in taken:
+                        break
+                else:
+                    raise ValueError(f"Could not find a new image name beside {source}.")
+                taken.add(str(destination).casefold())
+                root, key, filesystem = self._member_host({"path": str(destination)})
+                if filesystem.upper() == "FAT32" and requested_mib > 0xFFFFFFFF // MIB:
+                    raise ValueError(f"FAT32 cannot hold the requested copy of {source.name}.")
+                previous = requested_by_host.get(key, (root, 0))[1]
+                requested_by_host[key] = (root, previous + requested_mib)
+                specs.append((str(source), str(destination), requested_mib * MIB))
+            if not growing:
+                raise ValueError("Increase the size of at least one member.")
+            for root, requested_mib in requested_by_host.values():
+                if shutil.disk_usage(root).free // MIB < requested_mib:
+                    raise ValueError(
+                        f"Not enough space on {root} for the new copies "
+                        f"({requested_mib:,} MiB needed)."
+                    )
+            old_config = Path(self.config_path)
+            for number in range(1, 10001):
+                suffix = "-grown" if number == 1 else f"-grown-{number}"
+                new_config = old_config.with_name(f"{old_config.stem}{suffix}.json")
+                if not new_config.exists():
+                    break
+            else:
+                raise ValueError("Could not find an unused config name.")
+        except (OSError, ValueError) as exc:
+            self._error(str(exc))
+            return
+        total_mib = sum(size // MIB for _, _, size in specs)
+        if QMessageBox.question(
+            self, "Confirm expanded copies",
+            f"Create {len(specs)} new member copies totaling {total_mib:,} MiB "
+            f"and save {new_config.name}? The current images and config remain intact."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            encrypted = bool(self.backend.config_is_encrypted(self.config_path)["encrypted"])
+        except Exception as exc:
+            self._error(str(exc))
+            return
+        password = self._password("Unlock pool to expand") if encrypted else None
+        if encrypted and password is None:
+            return
+        backend = self.backend
+        secret_holder = [password]
+        password = None
+
+        def work() -> dict[str, Any]:
+            try:
+                backend.grow_v6(specs, secret_holder[0])
+                backend.save_config(
+                    str(new_config), str(config["name"]), str(config["drive"]),
+                    [destination for _, destination, _ in specs],
+                    bool(config["requireEncrypted"]),
+                )
+                return backend.load_config(str(new_config))
+            finally:
+                secret_holder[0] = None
+
+        def completed(result: dict[str, Any]) -> None:
+            self.config_path = str(new_config)
+            self.config = result
+            self.members = [{"path": path, "planned": False}
+                            for path in result["members"]]
+            self._refresh_members()
+            self._message(f"Expanded copies ready: {new_config.name}")
+            QMessageBox.information(
+                self, "Expanded pool ready",
+                f"The expanded images passed verification. The manager now uses "
+                f"{new_config.name}. Original images and config remain intact."
+            )
+
+        def failed(message: str) -> None:
+            created = [destination for _, destination, _ in specs
+                       if Path(destination).exists()]
+            if created:
+                self._message("Expansion incomplete; original images remain intact.")
+                QMessageBox.warning(
+                    self, "Expansion incomplete",
+                    f"{message}\n\nOriginal images and config remain intact. "
+                    "Do not mount these incomplete new copies; inspect them before retrying:\n" +
+                    "\n".join(created)
+                )
+            else:
+                self._error(message)
+
+        self._run_operation("Expanding and verifying member copies…", work, completed, failed)
+
+    def save_config(self) -> bool:
+        if self.backend is None:
+            self._error("Native PoolFS bridge is unavailable.")
+            return False
+        if not self.members or any(m.get("planned") for m in self.members):
+            self._error("Create queued image files before saving their config.")
+            return False
+        try:
+            name = validate_pool_name(self.pool_name.text())
+        except ValueError as exc:
+            self._error(str(exc))
+            return False
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Save PoolFS config", self.config_path or f"poolfs-{name}.json",
+            "JSON files (*.json)"
+        )
+        if not destination:
+            return False
+        if not destination.lower().endswith(".json"):
+            destination += ".json"
+        expected = {
+            "name": name,
+            "drive": self.drive_combo.currentText(),
+            "requireEncrypted": self.require_check.isChecked(),
+            "members": [str(m["path"]) for m in self.members],
+        }
+        result = self._call_sync(
+            "Saving PoolFS config…",
+            lambda: self.backend.save_config(
+                destination, expected["name"], expected["drive"], expected["members"],
+                expected["requireEncrypted"],
+            ),
+        )
+        if result is None:
+            return False
+        self.config = expected
+        self.config_path = destination
+        self._refresh_members()
+        self._message(f"Saved {Path(destination).name}")
+        return True
+
+    def _current_config(self) -> dict[str, Any] | None:
+        if self.backend is None:
+            self._error("Native PoolFS bridge is unavailable.")
+            return None
+        if not self.config_path:
+            self._error("Save a JSON config before mounting or verifying.")
+            return None
+        current = {
+            "name": self.pool_name.text(),
+            "drive": self.drive_combo.currentText(),
+            "requireEncrypted": self.require_check.isChecked(),
+            "members": [str(m["path"]) for m in self.members],
+        }
+        if current != self.config:
+            self._error("The config options or members changed. Save them before continuing.")
+            return None
+        return current
+
+    def mount_pool(self) -> None:
+        config = self._current_config()
+        if config is None or self.backend is None:
+            return
+        encryption = self._call_sync(
+            "Inspecting pool encryption…",
+            lambda: self.backend.config_is_encrypted(self.config_path or ""),
+        )
+        if encryption is None:
+            return
+        password = self._password("Unlock PoolFS") if encryption.get("encrypted") else None
+        if encryption.get("encrypted") and password is None:
+            return
+        backend = self.backend
+        config_path = self.config_path or ""
+        secret_holder = [password]
+        password = None
+
+        def work() -> dict[str, Any]:
+            try:
+                return backend.mount_config(config_path, config, secret_holder[0])
+            finally:
+                secret_holder[0] = None
+
+        def completed(result: dict[str, Any]) -> None:
+            self._message(f"Mounted PoolFS on {config['drive']}")
+            QMessageBox.information(self, "Pool mounted", f"PoolFS is available at {config['drive']}")
+
+        self._run_operation("Mounting PoolFS…", work, completed)
+
+    def verify_pool(self) -> None:
+        config = self._current_config()
+        if config is None or self.backend is None:
+            return
+        encryption = self._call_sync(
+            "Inspecting pool encryption…",
+            lambda: self.backend.config_is_encrypted(self.config_path or ""),
+        )
+        if encryption is None:
+            return
+        password = self._password("Verify encrypted pool") if encryption.get("encrypted") else None
+        if encryption.get("encrypted") and password is None:
+            return
+        backend = self.backend
+        config_path = self.config_path or ""
+        secret_holder = [password]
+        password = None
+
+        def work() -> dict[str, Any]:
+            try:
+                return backend.verify_config(config_path, secret_holder[0])
+            finally:
+                secret_holder[0] = None
+
+        def completed(result: dict[str, Any]) -> None:
+            summary = (
+                f"Data issues: {result.get('issues', '?')}\n"
+                f"Capacity: {human_size(result.get('capacity'))}\n"
+                f"Available: {human_size(result.get('available'))}\n"
+                f"Incomplete journal tail: {'yes' if result.get('incompleteTail') else 'no'}"
+            )
+            QMessageBox.information(self, "Verification result", summary)
+            self._message("Pool verification completed.")
+
+        self._run_operation("Verifying PoolFS data…", work, completed)
+
+    def unmount_pool(self) -> None:
+        if self.backend is None:
+            self._error("Native PoolFS bridge is unavailable.")
+            return
+        drive = self.drive_combo.currentText()
+        backend = self.backend
+
+        def completed(result: dict[str, Any]) -> None:
+            self._message(f"Unmounted {drive}")
+            QMessageBox.information(self, "Pool unmounted", f"PoolFS was unmounted from {drive}.")
+            self._update_partition_buttons()
+
+        self._run_operation(
+            f"Unmounting {drive}…", lambda: backend.unmount(drive), completed
+        )
+
+    def restart_as_admin(self) -> None:
+        if os.name != "nt":
+            self._error("Partition controls currently require Windows.")
+            return
+        if self.inventory.get("partitionElevated"):
+            QMessageBox.information(self, "Administrator", "This manager is already elevated.")
+            return
+        bridge_argument = (
+            f'--bridge "{Path(self.backend.path).resolve()}"'
+            if self.backend is not None else ""
+        )
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            arguments = bridge_argument or None
+        else:
+            executable = sys.executable
+            script = Path(__file__).resolve()
+            arguments = f'"{script}" {bridge_argument}'.rstrip()
+        shell_execute = ctypes.windll.shell32.ShellExecuteW
+        shell_execute.restype = ctypes.c_void_p
+        result = shell_execute(None, "runas", executable, arguments, None, 1)
+        if not result or int(result) <= 32:
+            self._error("Administrator restart was cancelled or unavailable.")
+        else:
+            self._message("Opened a separate Administrator PoolFS Manager window.")
+
+    def _update_partition_buttons(self) -> None:
+        disk = self._selected_disk()
+        part = self._selected_partition()
+        elevated = bool(self.inventory.get("partitionElevated"))
+        mounted = []
+        if elevated and self.backend is not None:
+            try:
+                mounted = self.backend.mounts().get("mountedDrives", [])
+            except Exception:
+                mounted = ["unknown"]
+        ready = elevated and not mounted
+        disk_number = disk.get("number", 0) if disk else 0
+        disk_style = disk.get("partitionStyle") if disk else None
+        raw = ready and disk_number != 0 and disk_style == 2
+        gpt = ready and disk_number != 0 and disk_style == 1
+        basic = bool(part and str(part.get("type", "")).upper().startswith("{EBD0A0A2-"))
+        self.partition_buttons[0].setEnabled(raw)
+        self.partition_buttons[1].setEnabled(gpt)
+        for action in (2, 3, 4):
+            self.partition_buttons[action].setEnabled(gpt and basic)
+        self.partition_notice.setText(
+            "Choose Run as admin to enable partition controls. Adding images needs no elevation."
+            if not elevated else
+            "Unmount all PoolFS drives before changing host partitions."
+            if mounted else
+            "Select a disk or basic-data partition. Every change gets a preview and typed confirmation."
+        )
+
+    def _partition_options(self, request: PartitionRequest, action: int) -> bool:
+        if action not in (1, 2, 4):
+            return True
+        dialog = QDialog(self)
+        dialog.setWindowTitle(
+            "Create partition" if action == 1 else
+            "Quick format" if action == 2 else "Change drive letter"
+        )
+        dialog.setMinimumWidth(380)
+        form = QFormLayout(dialog)
+        size = QSpinBox()
+        size.setRange(512, 16_000_000)
+        size.setValue(512)
+        size.setSuffix(" MiB")
+        maximum = QCheckBox("Use maximum available space")
+        if action == 1:
+            form.addRow("Size", size)
+            form.addRow("", maximum)
+        letter = QComboBox()
+        letter.addItems([chr(value) for value in range(ord("D"), ord("Z") + 1)])
+        if action in (1, 4):
+            form.addRow("New drive letter", letter)
+        filesystem = QComboBox()
+        filesystem.addItems(["NTFS", "exFAT", "FAT32"])
+        name = QLineEdit()
+        if action in (1, 2):
+            form.addRow("File system", filesystem)
+            form.addRow("Label", name)
+        controls = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        controls.accepted.connect(dialog.accept)
+        controls.rejected.connect(dialog.reject)
+        form.addRow(controls)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        if action == 1:
+            request.size_mib = 0 if maximum.isChecked() else size.value()
+        if action in (1, 4):
+            request.drive_letter = letter.currentText()
+        if action in (1, 2):
+            request.filesystem = filesystem.currentText()
+            request.label = name.text()
+        return True
+
+    def _confirm_partition(self, summary: str, phrase: str) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Confirm partition change")
+        dialog.setMinimumWidth(560)
+        box = QVBoxLayout(dialog)
+        box.setContentsMargins(22, 22, 22, 18)
+        box.addWidget(label("Review the exact target", "section"))
+        details = label(summary, "muted", True)
+        details.setMinimumHeight(86)
+        box.addWidget(details)
+        box.addWidget(label(f"Type {phrase} to continue.", "muted"))
+        typed = QLineEdit()
+        typed.setPlaceholderText(phrase)
+        box.addWidget(typed)
+        controls = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        accept = controls.button(QDialogButtonBox.StandardButton.Ok)
+        accept.setEnabled(False)
+        typed.textChanged.connect(lambda value: accept.setEnabled(value == phrase))
+        controls.accepted.connect(dialog.accept)
+        controls.rejected.connect(dialog.reject)
+        box.addWidget(controls)
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
+    def partition_action(self, action: int) -> None:
+        if self.backend is None:
+            self._error("Native PoolFS bridge is unavailable.")
+            return
+        disk = self._selected_disk()
+        part = self._selected_partition()
+        if disk is None or (action in (2, 3, 4) and part is None):
+            self._error("Select the exact disk or partition row first.")
+            return
+        request = PartitionRequest()
+        request.action = action
+        request.disk_number = int(disk["number"])
+        request.expected_disk_bytes = int(disk.get("totalBytes") or 0)
+        request.expected_disk_guid = str(disk.get("diskGuid") or "")
+        request.partition_number = int(part.get("number", 0)) if part else 0
+        request.expected_partition_guid = str(part.get("partitionGuid") or "") if part else ""
+        request.expected_partition_offset = int(part.get("offsetBytes") or 0) if part else 0
+        request.expected_partition_bytes = int(part.get("lengthBytes") or 0) if part else 0
+        request.size_mib = 0
+        request.drive_letter = "\0"
+        request.filesystem = "NTFS"
+        request.label = ""
+        request.disk_token = ""
+        if not self._partition_options(request, action):
+            return
+        phrase = f"Disk {disk['number']}"
+        if action in (2, 3, 4) and part is not None:
+            phrase += f" Partition {part['number']}"
+        backend = self.backend
+
+        def applied(result: dict[str, Any]) -> None:
+            self.refresh_inventory()
+            QMessageBox.information(self, "Partition changed", str(result.get("summary", "")))
+
+        def apply_failed(message: str) -> None:
+            self._error(message)
+            self.refresh_inventory()
+
+        def previewed(preview: dict[str, Any]) -> None:
+            if not self._confirm_partition(str(preview.get("summary", "")), phrase):
+                self._message("Partition change cancelled.")
+                return
+            request.disk_token = str(preview.get("diskToken") or "")
+            self._run_operation(
+                "Applying partition change…",
+                lambda: backend.partition(request, True),
+                applied, apply_failed,
+            )
+
+        self._run_operation(
+            "Checking disk identity and partition safety…",
+            lambda: backend.partition(request, False), previewed,
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="PoolFS Qt desktop manager")
+    parser.add_argument("--bridge", type=Path, help="Native PoolFS bridge DLL")
+    parser.add_argument("--screenshot", type=Path, help="Save a screenshot and exit")
+    parser.add_argument("--page", choices=("Pool", "Storage", "Images"), default="Storage")
+    args = parser.parse_args()
+    app = QApplication(sys.argv[:1])
+    app.setStyle("Fusion")
+    app.setStyleSheet(STYLE)
+    backend: NativeBackend | None
+    try:
+        backend = NativeBackend(args.bridge)
+    except Exception as exc:
+        backend = None
+        startup_error = str(exc)
+    else:
+        startup_error = ""
+    window = ManagerWindow(backend, auto_refresh=args.screenshot is None)
+    if startup_error:
+        window._message(startup_error)
+    if args.screenshot is not None:
+        window.load_inventory_sync()
+        if args.page == "Images" and backend is not None:
+            try:
+                window._on_images(backend.scan_images())
+            except Exception as exc:
+                window._message(str(exc))
+                window._images_scanned = True
+        window._set_page(args.page)
+        window.show()
+        def capture() -> None:
+            args.screenshot.parent.mkdir(parents=True, exist_ok=True)
+            if not window.grab().save(str(args.screenshot), "PNG"):
+                raise RuntimeError(f"Could not save screenshot to {args.screenshot}")
+            app.quit()
+        QTimer.singleShot(180, capture)
+    else:
+        window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
