@@ -324,9 +324,26 @@ ToolResult run_capture(const fs::path& executable,
     return {static_cast<unsigned>(code), wide_text(bytes)};
 }
 
-std::vector<wchar_t> mount_environment() {
-    const fs::path winfsp = L"C:\\Program Files (x86)\\WinFsp\\bin";
-    if (!fs::is_directory(winfsp)) return {};
+fs::path winfsp_runtime_directory() {
+    std::array<wchar_t, 32768> install_dir{};
+    DWORD bytes = static_cast<DWORD>(install_dir.size() * sizeof(wchar_t));
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\WinFsp",
+            L"InstallDir", RRF_RT_REG_SZ, nullptr, install_dir.data(),
+            &bytes) == ERROR_SUCCESS && install_dir[0])
+        return fs::path(install_dir.data()) / L"bin";
+    return L"C:\\Program Files (x86)\\WinFsp\\bin";
+}
+
+fs::path require_winfsp_runtime() {
+    const auto winfsp = winfsp_runtime_directory();
+    if (!fs::is_regular_file(winfsp / L"winfsp-x64.dll"))
+        throw std::runtime_error(
+            "WinFsp is required to mount PoolFS. Install the WinFsp runtime "
+            "from https://winfsp.dev/rel/ and try again.");
+    return winfsp;
+}
+
+std::vector<wchar_t> mount_environment(const fs::path& winfsp) {
     LPWCH block = GetEnvironmentStringsW();
     if (!block) windows_error("cannot read process environment");
     std::vector<std::wstring> entries;
@@ -488,6 +505,7 @@ void mount_config(const fs::path& config_path, const MountConfig& expected,
     const auto absolute = fs::absolute(config_path).lexically_normal();
     const auto config = load_mount_config(absolute);
     confirm_config_snapshot(config, expected, absolute);
+    const auto winfsp = require_winfsp_runtime();
     const auto discovery = discover_config(absolute);
     if (discovery.exit_code != 0)
         throw std::runtime_error("configured member validation failed: " +
@@ -526,7 +544,7 @@ void mount_config(const fs::path& config_path, const MountConfig& expected,
     for (const auto& member : config.members)
         arguments.push_back(member.wstring());
     auto command = command_line(executable, arguments);
-    auto environment = mount_environment();
+    auto environment = mount_environment(winfsp);
     if (!environment.empty()) flags |= CREATE_UNICODE_ENVIRONMENT;
     PROCESS_INFORMATION info{};
     if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr,
@@ -553,6 +571,10 @@ void mount_config(const fs::path& config_path, const MountConfig& expected,
                 windows_error("cannot inspect PoolFS mount exit status");
             if (secret && code == 5)
                 throw std::runtime_error("invalid PoolFS password or encrypted header");
+            if (code == 0xC0000135)
+                throw std::runtime_error(
+                    "PoolFS mount could not start because a required DLL is missing. "
+                    "Check the WinFsp installation and keep the PoolFS package files together.");
             throw std::runtime_error("PoolFS mount exited before becoming ready (exit " +
                                      std::to_string(code) + ")");
         }

@@ -12,9 +12,60 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manager"))
 
-from PySide6.QtCore import QTimer  # noqa: E402
-from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
+from PySide6.QtCore import Qt, QTimer  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QTableWidgetItem  # noqa: E402
 from app import MIB, ManagerWindow, validate_pool_name  # noqa: E402
+
+
+def check_member_names(window: ManagerWindow) -> None:
+    """Queued images use one ascending filename sequence across host volumes."""
+    window.host_volumes = [
+        {"diskNumber": index, "partitionNumber": 1, "filesystem": "NTFS",
+         "mountPaths": [f"{letter}:\\"], "guidPath": f"volume-{letter}"}
+        for index, letter in enumerate(("H", "T"), 1)
+    ]
+    window.volumes_table.blockSignals(True)
+    window.volumes_table.setRowCount(2)
+    for row in range(2):
+        item = QTableWidgetItem("Use")
+        item.setCheckState(Qt.CheckState.Unchecked)
+        window.volumes_table.setItem(row, 0, item)
+    window.volumes_table.blockSignals(False)
+
+    def queue(*rows: int) -> None:
+        for row in rows:
+            window.volumes_table.item(row, 0).setCheckState(Qt.CheckState.Checked)
+        window.queue_volumes()
+
+    def names() -> list[str]:
+        return [Path(str(member["path"])).name for member in window.members]
+
+    with (patch.object(window, "_same_mount", return_value=True),
+          patch("app.shutil.disk_usage", return_value=SimpleNamespace(free=10_000 * MIB)),
+          patch.object(Path, "exists", autospec=True, return_value=False)):
+        queue(0, 1)
+        assert names() == ["member-1.img", "member-2.img"]
+        window.members.clear()
+        window._refresh_members()
+        queue(0)
+        queue(1)
+        assert names() == ["member-1.img", "member-2.img"]
+
+    window.members.clear()
+    window._refresh_members()
+    occupied = str(Path(r"H:\PoolFS\member-1.img")).casefold()
+    with (patch.object(window, "_same_mount", return_value=True),
+          patch("app.shutil.disk_usage", return_value=SimpleNamespace(free=10_000 * MIB)),
+          patch.object(Path, "exists", autospec=True,
+                       side_effect=lambda path: str(path).casefold() == occupied)):
+        queue(0, 1)
+        assert names() == ["member-2.img", "member-3.img"]
+    with (patch.object(QFileDialog, "getSaveFileName",
+                       return_value=(r"U:\PoolFS\member-2.img", "")),
+          patch.object(window, "_error") as show_error):
+        window.add_new_image_path()
+        assert names() == ["member-2.img", "member-3.img"]
+        show_error.assert_called_once()
 
 
 def check_image_size_controls(window: ManagerWindow) -> None:
@@ -108,6 +159,8 @@ def main() -> None:
         else:
             raise AssertionError(f"Invalid pool name was accepted: {invalid!r}")
 
+    check_member_names(window)
+
     saved: list[tuple[object, ...]] = []
 
     class FakeBackend:
@@ -138,7 +191,11 @@ def main() -> None:
         results.append(result)
         QTimer.singleShot(50, application.quit)
 
-    window._run_operation("Checking…", slow_work, completed)
+    assert window.create_progress.isHidden()
+    window._run_operation("Creating PoolFS images…", slow_work, completed,
+                          show_progress=True)
+    assert not window.create_progress.isHidden()
+    assert window.create_progress.minimum() == window.create_progress.maximum() == 0
     QTimer.singleShot(
         40,
         lambda: events.append(window._running_operation and
@@ -149,6 +206,25 @@ def main() -> None:
     assert events == [True], "the Qt event loop stalled during the operation"
     assert results == [{"done": True}], "the worker result was not delivered"
     assert not window._running_operation
+    assert window.create_progress.isHidden()
+    assert window.centralWidget().isEnabled()
+    failures: list[str] = []
+
+    def failing_work() -> None:
+        raise RuntimeError("format failed")
+
+    def failed(message: str) -> None:
+        failures.append(message)
+        QTimer.singleShot(50, application.quit)
+
+    window._run_operation("Creating PoolFS images…", failing_work,
+                          lambda _result: None, failed, show_progress=True)
+    assert not window.create_progress.isHidden()
+    QTimer.singleShot(3000, application.quit)
+    application.exec()
+    assert failures == ["format failed"]
+    assert not window._running_operation
+    assert window.create_progress.isHidden()
     assert window.centralWidget().isEnabled()
     print("PoolFS Qt manager task test passed")
 

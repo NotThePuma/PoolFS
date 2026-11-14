@@ -26,7 +26,9 @@ manager runs from Python source. Keep that native build together.
    each volume. Click a disk below to inspect its partitions; that selection
    is optional when creating a pool. Click **Add selected volumes to pool**.
    The manager queues a new `PoolFS\member-N.img` path on each selected
-   volume and switches to **Pool**. It does not create the images yet.
+   volume and switches to **Pool**. Member numbers are unique across the new
+   pool, starting at 1 and increasing in selection order; an occupied name
+   is skipped. It does not create the images yet.
 2. On **Pool**, enter a name and choose an unused mount drive. Each queued
    image starts at 384 MiB. Select a new image in the member list, then drag
    the size slider or enter an exact size in MiB. The maximum uses current

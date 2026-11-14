@@ -16,7 +16,7 @@ from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget, QAbstractItemView,
 )
@@ -85,6 +85,9 @@ QScrollArea QWidget#qt_scrollarea_viewport, QWidget#page { background: #0b1220; 
 QScrollBar:vertical { width: 10px; background: #111d2d; }
 QScrollBar::handle:vertical { background: #344c65; border-radius: 5px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QProgressBar { background: #17263a; border: 1px solid #39506c;
+               border-radius: 5px; height: 9px; }
+QProgressBar::chunk { background: #77e5c1; border-radius: 4px; }
 QMessageBox, QDialog { background: #121d2e; }
 """
 
@@ -329,6 +332,14 @@ class ManagerWindow(QMainWindow):
         status_box.setContentsMargins(23, 0, 23, 0)
         self.status = label("Loading local storage…", "muted")
         status_box.addWidget(self.status, 1)
+        self.create_progress = QProgressBar()
+        self.create_progress.setObjectName("createProgress")
+        self.create_progress.setAccessibleName("Creating PoolFS member images")
+        self.create_progress.setTextVisible(False)
+        self.create_progress.setFixedWidth(220)
+        self.create_progress.setRange(0, 0)
+        self.create_progress.hide()
+        status_box.addWidget(self.create_progress)
         status_box.addWidget(label("PoolFS  •  local only", "micro"))
         shell.addWidget(status_frame)
 
@@ -654,16 +665,22 @@ class ManagerWindow(QMainWindow):
         self, activity: str, work: Callable[[], Any],
         complete: Callable[[Any], None],
         failure: Callable[[str], None] | None = None,
+        show_progress: bool = False,
     ) -> None:
         if self._running_operation:
             self._message("Wait for the current PoolFS operation to finish.")
             return
         self._running_operation = True
+        if show_progress:
+            self.create_progress.setRange(0, 0)
+            self.create_progress.show()
         self.centralWidget().setEnabled(False)
         self._message(activity)
 
         def finish() -> None:
             self._running_operation = False
+            if show_progress:
+                self.create_progress.hide()
             self.centralWidget().setEnabled(True)
 
         def succeeded(result: Any) -> None:
@@ -1149,6 +1166,9 @@ class ManagerWindow(QMainWindow):
             self._error("A PoolFS pool supports at most 16 member images.")
             return
         planned: list[dict[str, Any]] = []
+        used_names = {Path(str(member["path"])).name.casefold()
+                      for member in current_members}
+        next_number = 1
         for volume in selected:
             if volume.get("diskNumber") is None or volume.get("partitionNumber") is None:
                 self._error("Select a physical host volume; PoolFS virtual volumes cannot host a member image.")
@@ -1180,13 +1200,12 @@ class ManagerWindow(QMainWindow):
                 return
             folder = Path(root) / "PoolFS"
             candidate = None
-            for number in range(1, 10001):
+            for number in range(next_number, 10001):
                 option = folder / f"member-{number}.img"
-                if not option.exists() and all(
-                    str(m["path"]).casefold() != str(option).casefold()
-                    for m in [*current_members, *planned]
-                ):
+                if option.name.casefold() not in used_names and not option.exists():
                     candidate = option
+                    used_names.add(option.name.casefold())
+                    next_number = number + 1
                     break
             if candidate is None:
                 self._error("Could not find an unused member image name.")
@@ -1273,6 +1292,10 @@ class ManagerWindow(QMainWindow):
                 return
             if any(str(m["path"]).casefold() == path.casefold() for m in self.members):
                 self._error("This image path is already in the member list.")
+                return
+            if any(m.get("planned") and Path(str(m["path"])).name.casefold() ==
+                   Path(path).name.casefold() for m in self.members):
+                self._error("New member images in a pool must have different file names.")
                 return
             if len(self.members) >= 16:
                 self._error("A pool supports at most 16 images.")
@@ -1462,7 +1485,8 @@ class ManagerWindow(QMainWindow):
             )
             self.save_config()
 
-        self._run_operation("Creating PoolFS images…", work, completed, failed)
+        self._run_operation("Creating PoolFS images…", work, completed, failed,
+                            show_progress=True)
 
     def grow_images(self) -> None:
         config = self._current_config()
