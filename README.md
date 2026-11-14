@@ -228,5 +228,5 @@ checksums detect accidental damage. See [encryption details](docs/encryption.md)
 
 The native benchmark harness and dated test results are in
 [bench/BENCHMARKS.md](bench/BENCHMARKS.md). Older prototype formats and raw
-partition experiments are preserved in repository history and test notes; they
-are not part of the initial PoolFS product format.
+partition experiments are described in historical test notes; they are not
+part of the initial PoolFS product format.
