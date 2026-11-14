@@ -8,6 +8,7 @@
 #include <winfsp/winfsp.h>
 #include <sddl.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include "core.h"
 #include "mount_config.h"
@@ -893,14 +894,15 @@ int main() {
         SECURITY_ATTRIBUTES event_attributes{sizeof(SECURITY_ATTRIBUTES), event_security, FALSE};
         stop_event = CreateEventW(&event_attributes, TRUE, FALSE, event_name.c_str());
         const DWORD event_error = GetLastError();
-        LocalFree(event_security);
         if (!stop_event) {
+            LocalFree(event_security);
             FspFileSystemStopDispatcher(fs);
             FspFileSystemRemoveMountPoint(fs);
             FspFileSystemDelete(fs);
             throw std::runtime_error("could not create shutdown event");
         }
         if (event_error == ERROR_ALREADY_EXISTS) {
+            LocalFree(event_security);
             CloseHandle(stop_event);
             stop_event = nullptr;
             FspFileSystemStopDispatcher(fs);
@@ -908,16 +910,65 @@ int main() {
             FspFileSystemDelete(fs);
             throw std::runtime_error("a managed mount already owns that drive letter");
         }
+        const std::wstring reclaim_prefix = L"Local\\PoolFS.Reclaim." +
+            std::wstring(1, drive) + L".";
+        HANDLE reclaim_request = CreateEventW(&event_attributes, FALSE, FALSE,
+            (reclaim_prefix + L"Request").c_str());
+        const bool request_exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        HANDLE reclaim_success = CreateEventW(&event_attributes, TRUE, FALSE,
+            (reclaim_prefix + L"Success").c_str());
+        const bool success_exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        HANDLE reclaim_failure = CreateEventW(&event_attributes, TRUE, FALSE,
+            (reclaim_prefix + L"Failure").c_str());
+        const bool failure_exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        HANDLE reclaim_mutex = CreateMutexW(&event_attributes, FALSE,
+            (reclaim_prefix + L"Mutex").c_str());
+        const bool mutex_exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        LocalFree(event_security);
+        if (!reclaim_request || !reclaim_success || !reclaim_failure || !reclaim_mutex ||
+            request_exists || success_exists || failure_exists || mutex_exists) {
+            if (reclaim_request) CloseHandle(reclaim_request);
+            if (reclaim_success) CloseHandle(reclaim_success);
+            if (reclaim_failure) CloseHandle(reclaim_failure);
+            if (reclaim_mutex) CloseHandle(reclaim_mutex);
+            CloseHandle(stop_event);
+            stop_event = nullptr;
+            FspFileSystemStopDispatcher(fs);
+            FspFileSystemRemoveMountPoint(fs);
+            FspFileSystemDelete(fs);
+            throw std::runtime_error("could not create checkpoint control events");
+        }
         SetConsoleCtrlHandler(ConsoleHandler, TRUE);
         std::wcout << L"PoolFS mounted at " << mount_point
                    << L". Press Ctrl+C to unmount.\n";
-        if (stop_event) WaitForSingleObject(stop_event, INFINITE);
+        const HANDLE controls[]{stop_event, reclaim_request};
+        for (;;) {
+            const DWORD selected = WaitForMultipleObjects(2, controls, FALSE, INFINITE);
+            if (selected == WAIT_OBJECT_0) break;
+            if (selected != WAIT_OBJECT_0 + 1) break;
+            try {
+                {
+                    std::lock_guard lock(state->operation_mutex);
+                    state->pool.Checkpoint();
+                }
+                const auto root = std::wstring(1, drive) + L":\\";
+                SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, root.c_str(), nullptr);
+                SetEvent(reclaim_success);
+            } catch (const std::exception& error) {
+                std::cerr << "poolfs-mount: checkpoint: " << error.what() << '\n';
+                SetEvent(reclaim_failure);
+            }
+        }
         SetConsoleCtrlHandler(ConsoleHandler, FALSE);
         FspFileSystemStopDispatcher(fs);
         FspFileSystemRemoveMountPoint(fs);
         FspFileSystemDelete(fs);
         if (stop_event) CloseHandle(stop_event);
         stop_event = nullptr;
+        CloseHandle(reclaim_request);
+        CloseHandle(reclaim_success);
+        CloseHandle(reclaim_failure);
+        CloseHandle(reclaim_mutex);
         return 0;
     } catch (const std::exception& error) {
         if (inherited_password_pipe) CloseHandle(inherited_password_pipe);

@@ -172,6 +172,7 @@ public:
                       std::uint64_t creation_time, std::uint64_t last_access_time,
                       std::uint64_t last_write_time, std::uint64_t change_time);
     void Flush();
+    void Checkpoint(); // Publish current v6 state and release retired checkpoint blocks.
 
     std::uint64_t Capacity() const;
     std::uint64_t Available() const;

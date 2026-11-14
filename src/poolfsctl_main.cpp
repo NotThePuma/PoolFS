@@ -449,6 +449,51 @@ void managed_unmount(wchar_t drive) {
     throw std::runtime_error("unmount did not finish within 10 seconds");
 }
 
+void managed_reclaim(wchar_t drive) {
+    if (!active(drive))
+        throw std::runtime_error("no managed PoolFS mount on this drive");
+    const auto prefix = std::wstring(L"Local\\PoolFS.Reclaim.") + drive + L".";
+    UniqueHandle request(OpenEventW(EVENT_MODIFY_STATE, FALSE,
+                                    (prefix + L"Request").c_str()));
+    UniqueHandle success(OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
+                                    (prefix + L"Success").c_str()));
+    UniqueHandle failure(OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
+                                    (prefix + L"Failure").c_str()));
+    UniqueHandle stop(OpenEventW(SYNCHRONIZE, FALSE, event_name(drive).c_str()));
+    UniqueHandle mutex(OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE,
+                                  (prefix + L"Mutex").c_str()));
+    if (!request.value || !success.value || !failure.value || !stop.value ||
+        !mutex.value)
+        throw std::runtime_error("this mount does not support reclaim; remount with the updated PoolFS");
+    const auto root = std::wstring(1, drive) + L":\\";
+    ULARGE_INTEGER before{}, total{}, total_free{};
+    if (!GetDiskFreeSpaceExW(root.c_str(), &before, &total, &total_free))
+        throw std::runtime_error("cannot read mounted free space");
+    const DWORD acquired = WaitForSingleObject(mutex.value, 30000);
+    if (acquired != WAIT_OBJECT_0 && acquired != WAIT_ABANDONED)
+        throw std::runtime_error("timed out waiting for another reclaim operation");
+    try {
+        if (!ResetEvent(success.value) || !ResetEvent(failure.value) ||
+            !SetEvent(request.value))
+            throw std::runtime_error("cannot request checkpoint rotation");
+        const HANDLE results[]{success.value, failure.value, stop.value};
+        const DWORD result = WaitForMultipleObjects(3, results, FALSE, 30000);
+        if (result == WAIT_OBJECT_0 + 1)
+            throw std::runtime_error("checkpoint rotation failed; see poolfs-mount stderr");
+        if (result != WAIT_OBJECT_0)
+            throw std::runtime_error("checkpoint rotation did not complete within 30 seconds");
+    } catch (...) {
+        ReleaseMutex(mutex.value);
+        throw;
+    }
+    ReleaseMutex(mutex.value);
+    ULARGE_INTEGER after{};
+    if (!GetDiskFreeSpaceExW(root.c_str(), &after, &total, &total_free))
+        throw std::runtime_error("checkpoint rotated, but mounted free space cannot be read");
+    std::wcout << L"checkpoint rotated on " << drive << L":; available "
+               << before.QuadPart << L" -> " << after.QuadPart << L" bytes\n";
+}
+
 void usage() {
     std::wcerr << L"Usage: poolfsctl discover <seed.img> [search-root ...]\n"
                << L"       poolfsctl discover-config <config.json>\n"
@@ -457,6 +502,7 @@ void usage() {
                << L"       poolfsctl mount --config <config.json>\n"
                << L"       poolfsctl status <drive:>\n"
                << L"       poolfsctl unmount <drive:>\n"
+               << L"       poolfsctl reclaim <drive:>\n"
                << L"Positional discovery searches the seed folder and each drive's PoolFS folder.\n"
                << L"Config commands use only the member paths listed in JSON.\n"
                << L"Mount control is limited to this Windows logon session.\n";
@@ -475,9 +521,11 @@ int run(const std::vector<std::wstring>& args) {
             managed_mount(config.drive, found, config.name);
         return 0;
     }
-    if (args.size() == 3 && (args[1] == L"status" || args[1] == L"unmount")) {
+    if (args.size() == 3 && (args[1] == L"status" || args[1] == L"unmount" ||
+                             args[1] == L"reclaim")) {
         const auto drive = drive_letter(args[2]);
         if (args[1] == L"unmount") { managed_unmount(drive); return 0; }
+        if (args[1] == L"reclaim") { managed_reclaim(drive); return 0; }
         const bool mounted = active(drive);
         std::wcout << drive << L": " << (mounted ? L"mounted" : L"not managed") << L'\n';
         return mounted ? 0 : 1;

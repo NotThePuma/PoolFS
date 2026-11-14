@@ -103,6 +103,9 @@ $env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
 
 The controller finds the other member in the seed image's folder and keeps
 the mount running after the command returns. Use `R:\` as a drive, then run
+`.\build\poolfsctl.exe reclaim R:` to rotate the recovery checkpoint and make
+retained space available to the mounted drive. The manager has a **Reclaim space**
+button for the same operation. This does not shrink member images. Run
 `.\build\poolfsctl.exe unmount R:` before removing any host volume. Choose an
 unused drive letter if `R:` is occupied. Direct `poolfs-mount.exe` remains
 available for a foreground mount. See [pool management](docs/pool-management.md)

@@ -68,6 +68,8 @@ __declspec(dllexport) int __cdecl poolfs_bridge_verify_config(
     std::uint32_t password_chars, char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_unmount(
     wchar_t drive, char** response) noexcept;
+__declspec(dllexport) int __cdecl poolfs_bridge_reclaim(
+    wchar_t drive, char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_mounts(char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_partition(
     const PoolFsBridgePartitionRequest* request, int apply,

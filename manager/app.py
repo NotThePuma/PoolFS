@@ -469,9 +469,10 @@ class ManagerWindow(QMainWindow):
         self.save_button = button("Save config…", self.save_config)
         self.mount_button = button("Mount", self.mount_pool)
         self.verify_button = button("Verify data", self.verify_pool)
+        self.reclaim_button = button("Reclaim space", self.reclaim_space)
         self.unmount_button = button("Unmount", self.unmount_pool)
         for item in (self.create_button, self.grow_button, self.save_button, self.mount_button,
-                     self.verify_button, self.unmount_button):
+                     self.verify_button, self.reclaim_button, self.unmount_button):
             row.addWidget(item)
         row.addStretch()
         actions_box.addLayout(row)
@@ -1133,6 +1134,7 @@ class ManagerWindow(QMainWindow):
         self.grow_button.setEnabled(bool(self.config_path) and bool(self.members) and not planned)
         for item in (self.save_button, self.mount_button, self.verify_button):
             item.setEnabled(bool(self.members) and not planned)
+        self.reclaim_button.setEnabled(bool(self.config_path) and bool(self.members) and not planned)
 
     def _same_mount(self, path: str, expected: str) -> bool:
         if os.name != "nt":
@@ -1776,6 +1778,23 @@ class ManagerWindow(QMainWindow):
 
         self._run_operation(
             f"Unmounting {drive}…", lambda: backend.unmount(drive), completed
+        )
+
+    def reclaim_space(self) -> None:
+        config = self._current_config()
+        if config is None or self.backend is None:
+            return
+        drive = str(config["drive"])
+        backend = self.backend
+
+        def completed(result: dict[str, Any]) -> None:
+            report = str(result.get("output", "Checkpoint rotated.")).strip()
+            self._message(report)
+            QMessageBox.information(self, "Space reclaimed", report)
+            self.refresh_inventory()
+
+        self._run_operation(
+            f"Reclaiming space on {drive}…", lambda: backend.reclaim(drive), completed
         )
 
     def restart_as_admin(self) -> None:

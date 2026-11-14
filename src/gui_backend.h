@@ -37,6 +37,7 @@ void mount_config(const std::filesystem::path& config_path,
                   const password::Secret* secret = nullptr);
 bool mounted(wchar_t drive);
 void unmount(wchar_t drive);
+ToolResult reclaim(wchar_t drive);
 void format_v6_images(const std::vector<ImageMemberSpec>& members,
                       const password::Secret* secret = nullptr);
 VerifyResult verify_pool(const MountConfig& config,

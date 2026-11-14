@@ -3474,6 +3474,22 @@ void Pool::Flush() {
     // synchronized its data and mirrored journal before it returns.
     std::lock_guard lock(impl_->mutex);
 }
+void Pool::Checkpoint() {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->geometry.version != 6)
+        throw Error(ErrorCode::InvalidArgument, "manual checkpoint requires v6");
+    if (!impl_->writable)
+        throw Error(ErrorCode::ReadOnly, "pool is read-only after a failed write");
+    try {
+        impl_->rotate_v4_checkpoint();
+    } catch (const Error& error) {
+        if (error.code() != ErrorCode::JournalFull) impl_->writable = false;
+        throw;
+    } catch (...) {
+        impl_->writable = false;
+        throw;
+    }
+}
 std::uint64_t Pool::Capacity() const {
     std::lock_guard lock(impl_->mutex);
     std::uint64_t total = 0;

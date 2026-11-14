@@ -19,9 +19,10 @@ $binaryDir = if ([IO.Path]::IsPathRooted($BinaryDirectory)) {
 }
 $formatter = Join-Path $binaryDir 'poolfs-format.exe'
 $mounter = Join-Path $binaryDir 'poolfs-mount.exe'
+$controller = Join-Path $binaryDir 'poolfsctl.exe'
 $scrubber = Join-Path $binaryDir 'poolfs-scrub.exe'
 $checker = Join-Path $binaryDir 'poolfs-check.exe'
-foreach ($binary in @($formatter, $mounter, $scrubber, $checker)) {
+foreach ($binary in @($formatter, $mounter, $controller, $scrubber, $checker)) {
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
         throw "Required binary is missing: $binary"
     }
@@ -209,6 +210,41 @@ try {
     }
     $env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
     Start-TestMount 1
+
+    # Query the mounted drive through Windows, not only Pool::Available().
+    $spaceBefore = [IO.DriveInfo]::new($DriveLetter).AvailableFreeSpace
+    $spaceProbe = Join-Path $volume 'free-space-probe.bin'
+    $spaceBlock = New-Object byte[] (1MB)
+    $spaceStream = [IO.FileStream]::new($spaceProbe, [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write)
+    try {
+        for ($i = 0; $i -lt 8; $i++) {
+            $spaceStream.Write($spaceBlock, 0, $spaceBlock.Length)
+        }
+        $spaceStream.Flush($true)
+    } finally { $spaceStream.Dispose() }
+    $spaceAfterWrite = [IO.DriveInfo]::new($DriveLetter).AvailableFreeSpace
+    if ($spaceAfterWrite -ne $spaceBefore - 8MB) {
+        throw "Mounted free space did not fall by 8 MiB: $spaceBefore -> $spaceAfterWrite"
+    }
+    $firstReclaim = @(& $controller reclaim ($DriveLetter + ':') 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot publish checkpoint: $($firstReclaim -join [Environment]::NewLine)"
+    }
+    [IO.File]::Delete($spaceProbe)
+    $spaceAfterDelete = [IO.DriveInfo]::new($DriveLetter).AvailableFreeSpace
+    if ($spaceAfterDelete -ne $spaceAfterWrite) {
+        throw "Checkpoint-held space became reusable before rotation: $spaceAfterWrite -> $spaceAfterDelete"
+    }
+    $secondReclaim = @(& $controller reclaim ($DriveLetter + ':') 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot reclaim checkpoint space: $($secondReclaim -join [Environment]::NewLine)"
+    }
+    $spaceAfterReclaim = [IO.DriveInfo]::new($DriveLetter).AvailableFreeSpace
+    if ($spaceAfterReclaim -ne $spaceBefore) {
+        throw "Mounted free space did not recover after reclaim: $spaceBefore -> $spaceAfterReclaim"
+    }
+    Write-Host "Mounted free space: $spaceBefore -> $spaceAfterWrite -> $spaceAfterDelete -> $spaceAfterReclaim bytes (write/checkpoint/delete/reclaim)."
 
     $hello = Join-Path $volume 'hello.txt'
     [IO.File]::WriteAllText($hello, 'hello')
@@ -473,8 +509,13 @@ try {
 
     # Force the mount process to exit, then require full data and metadata
     # recovery on a fresh mount of the same member images.
+    $spaceBeforeRemount = [IO.DriveInfo]::new($DriveLetter).AvailableFreeSpace
     Stop-TestMount
     Start-TestMount 2
+    $spaceAfterRemount = [IO.DriveInfo]::new($DriveLetter).AvailableFreeSpace
+    if ($spaceAfterRemount -ne $spaceBeforeRemount) {
+        throw "Mounted free space changed on remount: $spaceBeforeRemount -> $spaceAfterRemount"
+    }
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $spanning).Hash -ne $hash) {
         throw 'Cross-member file hash changed after remount'
     }

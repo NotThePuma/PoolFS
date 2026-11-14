@@ -51,6 +51,13 @@ manager runs from Python source. Keep that native build together.
    password; unencrypted pools do not. All member images listed in the config
    must be present.
 
+While a pool is mounted, choose **Reclaim space** to publish a fresh recovery
+checkpoint. Blocks held only by the previous checkpoint become available to
+the mounted drive, and Windows is notified to refresh the drive display. This
+does not shrink the member image files or securely erase old blocks. You can also run
+`poolfsctl reclaim V:` for a mounted `V:` pool in the same Windows logon session.
+Flush, unmount, and remount do not force checkpoint rotation.
+
 If image creation fails partway through, the manager reports the files already
 created and leaves them in place. Inspect those paths before starting again.
 

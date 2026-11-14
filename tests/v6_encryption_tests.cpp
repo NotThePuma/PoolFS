@@ -148,6 +148,20 @@ void test_encrypted_pool() {
                 "partial-sector write was short");
         std::copy(patch.begin(), patch.end(), expected.begin() + 7000);
         pool.Flush();
+        pool.Checkpoint();
+        const auto before_reclaim = pool.Available();
+        pool.Create("private/reclaim.bin");
+        const std::array<std::byte, kSectorBytes> disposable{};
+        require(pool.Write("private/reclaim.bin", 0, disposable) == disposable.size(),
+                "encrypted checkpoint fixture write was short");
+        pool.Checkpoint();
+        const auto held = pool.Available();
+        pool.Remove("private/reclaim.bin");
+        require(pool.Available() == held,
+                "encrypted checkpoint released protected data early");
+        pool.Checkpoint();
+        require(pool.Available() == before_reclaim,
+                "encrypted checkpoint did not reclaim deleted data");
     }
     std::reverse(files.members.begin(), files.members.end());
     {

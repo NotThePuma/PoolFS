@@ -532,6 +532,17 @@ extern "C" int __cdecl poolfs_bridge_unmount(
     });
 }
 
+extern "C" int __cdecl poolfs_bridge_reclaim(
+        wchar_t drive, char** response) noexcept {
+    return invoke(response, [&] {
+        const auto report = gui::reclaim(drive_letter(drive));
+        std::string out = "{\"output\":";
+        json_string(out, report.output);
+        out.push_back('}');
+        return out;
+    });
+}
+
 extern "C" int __cdecl poolfs_bridge_mounts(char** response) noexcept {
     return invoke(response, [] {
         std::string out = "{\"mountedDrives\":[";

@@ -272,7 +272,7 @@ ToolResult run_capture(const fs::path& executable,
 
     std::string bytes;
     const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::seconds(30);
+        std::chrono::seconds(45);
     for (;;) {
         DWORD available = 0;
         if (!PeekNamedPipe(read_pipe.value, nullptr, 0, nullptr,
@@ -309,7 +309,7 @@ ToolResult run_capture(const fs::path& executable,
         if (std::chrono::steady_clock::now() >= deadline) {
             TerminateProcess(child.value, 1);
             WaitForSingleObject(child.value, 1000);
-            throw std::runtime_error("PoolFS tool did not finish within 30 seconds");
+            throw std::runtime_error("PoolFS tool did not finish within 45 seconds");
         }
         Sleep(25);
     }
@@ -601,6 +601,15 @@ void unmount(wchar_t drive) {
         Sleep(125);
     }
     throw std::runtime_error("PoolFS unmount did not finish within 10 seconds");
+}
+
+ToolResult reclaim(wchar_t drive) {
+    drive = checked_drive(drive);
+    const auto report = run_capture(sibling_executable(L"poolfsctl.exe"),
+        {L"reclaim", std::wstring(1, drive) + L":"});
+    if (report.exit_code != 0)
+        throw std::runtime_error("PoolFS reclaim failed: " + utf8(report.output));
+    return report;
 }
 
 void format_v6_images(const std::vector<ImageMemberSpec>& members,
