@@ -71,6 +71,8 @@ __declspec(dllexport) int __cdecl poolfs_bridge_unmount(
 __declspec(dllexport) int __cdecl poolfs_bridge_reclaim(
     wchar_t drive, char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_mounts(char** response) noexcept;
+__declspec(dllexport) int __cdecl poolfs_bridge_stats(
+    wchar_t drive, char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_partition(
     const PoolFsBridgePartitionRequest* request, int apply,
     char** response) noexcept;

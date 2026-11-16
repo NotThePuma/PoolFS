@@ -13,6 +13,7 @@
 #include "gui_inventory.h"
 #include "gui_partition_ops.h"
 #include "mount_config.h"
+#include "mount_stats.h"
 #include "password.h"
 
 #include <algorithm>
@@ -554,6 +555,32 @@ extern "C" int __cdecl poolfs_bridge_mounts(char** response) noexcept {
             first = false;
         }
         out += "]}";
+        return out;
+    });
+}
+
+extern "C" int __cdecl poolfs_bridge_stats(
+        wchar_t drive, char** response) noexcept {
+    return invoke(response, [&] {
+        const auto selected = drive_letter(drive);
+        const auto stats = poolfs::mount_stats::Read(selected);
+        std::string out = "{\"drive\":\"";
+        out.push_back(static_cast<char>(selected));
+        out += ":\",\"readBytes\":";
+        json_number(out, stats.read_bytes);
+        out += ",\"writeBytes\":";
+        json_number(out, stats.write_bytes);
+        out += ",\"readOperations\":";
+        json_number(out, stats.read_operations);
+        out += ",\"writeOperations\":";
+        json_number(out, stats.write_operations);
+        out += ",\"uptimeMs\":";
+        json_number(out, stats.uptime_ms);
+        out += ",\"capacityBytes\":";
+        json_number(out, stats.capacity_bytes);
+        out += ",\"availableBytes\":";
+        json_number(out, stats.available_bytes);
+        out.push_back('}');
         return out;
     });
 }

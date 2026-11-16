@@ -3,6 +3,7 @@
 #include <shellapi.h>
 
 #include "mount_config.h"
+#include "mount_stats.h"
 #include "password.h"
 
 #include <algorithm>
@@ -494,6 +495,53 @@ void managed_reclaim(wchar_t drive) {
                << before.QuadPart << L" -> " << after.QuadPart << L" bytes\n";
 }
 
+void print_stats(wchar_t drive, const poolfs::mount_stats::Snapshot& first,
+                 const poolfs::mount_stats::Snapshot& latest, bool json) {
+    const auto elapsed = std::max<std::uint64_t>(1,
+        latest.uptime_ms > first.uptime_ms ? latest.uptime_ms - first.uptime_ms : 1);
+    const auto read_delta = latest.read_bytes >= first.read_bytes ?
+        latest.read_bytes - first.read_bytes : 0;
+    const auto write_delta = latest.write_bytes >= first.write_bytes ?
+        latest.write_bytes - first.write_bytes : 0;
+    const auto read_rate = static_cast<std::uint64_t>(
+        static_cast<double>(read_delta) * 1000.0 / static_cast<double>(elapsed));
+    const auto write_rate = static_cast<std::uint64_t>(
+        static_cast<double>(write_delta) * 1000.0 / static_cast<double>(elapsed));
+    if (json) {
+        std::wcout << L"{\"drive\":\"" << drive << L":\",\"readBytesPerSecond\":"
+                   << read_rate << L",\"writeBytesPerSecond\":" << write_rate
+                   << L",\"readBytes\":" << latest.read_bytes
+                   << L",\"writeBytes\":" << latest.write_bytes
+                   << L",\"readOperations\":" << latest.read_operations
+                   << L",\"writeOperations\":" << latest.write_operations
+                   << L",\"uptimeMs\":" << latest.uptime_ms
+                   << L",\"capacityBytes\":" << latest.capacity_bytes
+                   << L",\"availableBytes\":" << latest.available_bytes << L"}\n";
+    } else {
+        constexpr double mib = 1024.0 * 1024.0;
+        std::wcout << drive << L":  read " << std::fixed << std::setprecision(2)
+                   << static_cast<double>(read_rate) / mib << L" MiB/s, write "
+                   << static_cast<double>(write_rate) / mib << L" MiB/s\n"
+                   << L"  Total read " << latest.read_bytes << L" bytes ("
+                   << latest.read_operations << L" operations), written "
+                   << latest.write_bytes << L" bytes ("
+                   << latest.write_operations << L" operations)\n"
+                   << L"  Available " << latest.available_bytes << L" of "
+                   << latest.capacity_bytes << L" bytes; uptime "
+                   << latest.uptime_ms / 1000 << L" seconds\n";
+    }
+    std::wcout.flush();
+}
+
+void managed_stats(wchar_t drive, DWORD interval_ms, bool watch, bool json) {
+    do {
+        const auto first = poolfs::mount_stats::Read(drive);
+        Sleep(interval_ms);
+        const auto latest = poolfs::mount_stats::Read(drive);
+        print_stats(drive, first, latest, json);
+    } while (watch);
+}
+
 void usage() {
     std::wcerr << L"Usage: poolfsctl discover <seed.img> [search-root ...]\n"
                << L"       poolfsctl discover-config <config.json>\n"
@@ -503,6 +551,7 @@ void usage() {
                << L"       poolfsctl status <drive:>\n"
                << L"       poolfsctl unmount <drive:>\n"
                << L"       poolfsctl reclaim <drive:>\n"
+               << L"       poolfsctl stats <drive:> [--json] [--watch] [--interval-ms 1000]\n"
                << L"Positional discovery searches the seed folder and each drive's PoolFS folder.\n"
                << L"Config commands use only the member paths listed in JSON.\n"
                << L"Mount control is limited to this Windows logon session.\n";
@@ -529,6 +578,31 @@ int run(const std::vector<std::wstring>& args) {
         const bool mounted = active(drive);
         std::wcout << drive << L": " << (mounted ? L"mounted" : L"not managed") << L'\n';
         return mounted ? 0 : 1;
+    }
+    if (args.size() >= 3 && args[1] == L"stats") {
+        const auto drive = drive_letter(args[2]);
+        bool json = false;
+        bool watch = false;
+        DWORD interval_ms = 1000;
+        for (std::size_t i = 3; i < args.size(); ++i) {
+            if (args[i] == L"--json") json = true;
+            else if (args[i] == L"--watch") watch = true;
+            else if (args[i] == L"--interval-ms" && i + 1 < args.size()) {
+                const auto value = args[++i];
+                if (value.empty() || !std::all_of(value.begin(), value.end(),
+                        [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+                    throw std::invalid_argument("stats interval must be 100 to 10000 ms");
+                const auto parsed = std::stoul(value);
+                if (parsed < 100 || parsed > 10000)
+                    throw std::invalid_argument("stats interval must be 100 to 10000 ms");
+                interval_ms = static_cast<DWORD>(parsed);
+            } else {
+                usage();
+                return 2;
+            }
+        }
+        managed_stats(drive, interval_ms, watch, json);
+        return 0;
     }
     if (args.size() >= 3 && args[1] == L"discover") {
         std::vector<fs::path> roots;

@@ -64,6 +64,7 @@ $core = Join-Path $project 'src\core.cpp'
 $crypto = Join-Path $project 'src\crypto.cpp'
 $password = Join-Path $project 'src\password.cpp'
 $mountConfig = Join-Path $project 'src\mount_config.cpp'
+$mountStats = Join-Path $project 'src\mount_stats.cpp'
 $guiInventory = Join-Path $project 'src\gui_inventory.cpp'
 $guiBackend = Join-Path $project 'src\gui_backend.cpp'
 $guiBridge = Join-Path $project 'src\gui_bridge.cpp'
@@ -93,9 +94,9 @@ function Invoke-Build([string[]]$Arguments) {
 
 Invoke-Build ($common + @($core, $crypto, $password, $rawDevice, $formatter, '-lbcrypt', '-ladvapi32',
     '-o', (Join-Path $output 'poolfs-format.exe')))
-Invoke-Build ($common + @('-isystem', $sdkInclude, $core, $crypto, $password, $mountConfig, $rawDevice, $mount, $sdkLibrary,
+Invoke-Build ($common + @('-isystem', $sdkInclude, $core, $crypto, $password, $mountConfig, $mountStats, $rawDevice, $mount, $sdkLibrary,
     '-lbcrypt', '-ladvapi32', '-lshell32', '-o', (Join-Path $output 'poolfs-mount.exe')))
-Invoke-Build ($common + @($manager, $password, $mountConfig, '-lshell32',
+Invoke-Build ($common + @($manager, $password, $mountConfig, $mountStats, '-lshell32',
     '-o', (Join-Path $output 'poolfsctl.exe')))
 Invoke-Build ($common + @($core, $crypto, $password, $mountConfig, $rawDevice,
     $guiInventory, $guiBackend, $guiDialogs, $guiPartitions, $guiMain,
@@ -104,7 +105,7 @@ Invoke-Build ($common + @($core, $crypto, $password, $mountConfig, $rawDevice,
     '-Wl,--subsystem,windows',
     '-o', (Join-Path $output 'poolfs-manager-classic.exe')))
 Invoke-Build ($common + @($core, $crypto, $password, $mountConfig, $rawDevice,
-    $guiInventory, $guiBackend, $guiPartitions, $guiBridge,
+    $guiInventory, $guiBackend, $guiPartitions, $guiBridge, $mountStats,
     '-shared', '-lbcrypt', '-ladvapi32', '-lshell32', '-lole32',
     '-o', (Join-Path $output 'poolfs-gui-native.dll')))
 Invoke-Build ($common + @('-DPOOLFS_CRASH_V6', $core, $crypto, $rawDevice, $v4CrashTests,

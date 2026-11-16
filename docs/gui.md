@@ -21,15 +21,17 @@ manager runs from Python source. Keep that native build together.
 
 ## Create a pool
 
-1. On **Storage**, tick **Use** for one or more formatted entries in **Host
-   volumes**. The **Disk / part** column shows which physical partition holds
+1. On **Pool**, choose **Choose host volumes** to open **Storage**. Tick **Use**
+   for one or more formatted entries in **Host volumes**. The **Disk / part**
+   column shows which physical partition holds
    each volume. Click a disk below to inspect its partitions; that selection
-   is optional when creating a pool. Click **Add selected volumes to pool**.
+   is optional when creating a pool. Click **Continue with N volumes**.
    The manager queues a new `PoolFS\member-N.img` path on each selected
    volume and switches to **Pool**. Member numbers are unique across the new
    pool, starting at 1 and increasing in selection order; an occupied name
    is skipped. It does not create the images yet.
-2. On **Pool**, enter a name and choose an unused mount drive. Each queued
+2. On **Pool**, keep the default **PoolFS** name or enter your own, then choose
+   an unused mount drive. Each queued
    image starts at 384 MiB. Select a new image in the member list, then drag
    the size slider or enter an exact size in MiB. The maximum uses current
    free space on that image's host volume after reserving the sizes of other
@@ -57,6 +59,15 @@ the mounted drive, and Windows is notified to refresh the drive display. This
 does not shrink the member image files or securely erase old blocks. You can also run
 `poolfsctl reclaim V:` for a mounted `V:` pool in the same Windows logon session.
 Flush, unmount, and remount do not force checkpoint rotation.
+
+Open **Stats** to choose a mounted drive and see its current read and write
+speeds, a recent-speed graph, cumulative bytes and operations, and used and
+available pool space. The view updates each second. Read and write speeds
+measure completed file activity served by PoolFS; they exclude physical disk
+I/O, journal and checkpoint writes, checksums, and metadata operations. The
+same counters and space values are available with `poolfsctl stats V:`. Use
+`poolfsctl stats V: --watch` for continuous updates or add `--json` for one
+JSON object per sample. The mount must use a build that includes live stats.
 
 If image creation fails partway through, the manager reports the files already
 created and leaves them in place. Inspect those paths before starting again.
@@ -98,10 +109,24 @@ repair damage. A wrong or incomplete member list cannot mount. Use
 **Save config…** to save a new JSON config after moving images or changing the
 pool name or drive letter.
 
+After saving a config, tick **Mount when I sign in to Windows** to mount that
+pool for the current Windows account at the next sign-in. Each saved config has
+its own setting; use different mount letters when enabling multiple configs.
+Encrypted pools show a password prompt at sign-in; the password is never
+stored. PoolFS waits up to one minute for the config and all member images to
+appear, then leaves the manager open with an error if they remain unavailable.
+Untick the option to remove that pool's sign-in entry. This setting belongs to
+the current Windows account and machine, not the portable JSON config. Keep
+the manager executable and its companion binaries in the same location after
+enabling it.
+
 On **Images**, choose **Scan again** to scan the `PoolFS` folders on mounted
 host volumes. The scan is bounded and does not follow directory links. Select
-an image and choose **Add selected image to Pool** to build or update a config.
-All member images must be listed before mounting.
+any member image. When every member of that pool is present, choose **Load
+complete pool**; the manager loads all of its members in order. Name the pool
+and choose **Save config to mount**. The manager suggests an unused drive
+letter; after saving, **Mount** becomes available. If members are missing,
+the action stays disabled until the complete set is available.
 
 ## Host disks and partitions
 
@@ -110,7 +135,8 @@ without drive letters when Windows exposes them. Clicking a disk filters the
 partition list, which shows each partition's drive letter, file system, size,
 and label when known. **Host volumes** lists physical volumes with drive
 letters; tick several to queue new member images. This works without
-Administrator rights.
+Administrator rights. **Disk tools** jumps to the partition controls below;
+**Run as admin** appears there because only partition changes need elevation.
 If a host volume shows **Unformatted**, it cannot hold an image yet. Select
 its disk and partition above, use **Run as admin**, and choose **Quick format**
 after unmounting PoolFS drives. Formatting erases that partition's data.

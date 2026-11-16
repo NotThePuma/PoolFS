@@ -99,6 +99,7 @@ class NativeBackend:
         self._bind("unmount", [ctypes.c_wchar])
         self._bind("reclaim", [ctypes.c_wchar])
         self._bind("mounts", [])
+        self._bind("stats", [ctypes.c_wchar])
         self._bind("partition", [
             ctypes.POINTER(PartitionRequest), ctypes.c_int,
         ])
@@ -215,6 +216,9 @@ class NativeBackend:
 
     def mounts(self) -> dict[str, Any]:
         return self._call("mounts")
+
+    def stats(self, drive: str) -> dict[str, Any]:
+        return self._call("stats", drive[0])
 
     def unmount(self, drive: str) -> dict[str, Any]:
         return self._call("unmount", drive[0])

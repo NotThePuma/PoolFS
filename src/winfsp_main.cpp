@@ -13,6 +13,7 @@
 #include "core.h"
 #include "mount_config.h"
 #include "password.h"
+#include "mount_stats.h"
 
 #include <algorithm>
 #include <array>
@@ -124,6 +125,7 @@ struct MountState {
     }
 
     poolfs::Pool pool;
+    poolfs::mount_stats::Publisher stats;
     bool is_v6 = false;
     std::wstring volume_label = L"PoolFS Preview";
     PSECURITY_DESCRIPTOR security = nullptr;
@@ -509,6 +511,7 @@ NTSTATUS Read(FSP_FILE_SYSTEM* fs, PVOID context, PVOID buffer,
         if (offset >= size) return STATUS_END_OF_FILE;
         auto bytes = std::span<std::byte>(static_cast<std::byte*>(buffer), length);
         *transferred = static_cast<ULONG>(state.pool.Read(name, offset, bytes));
+        state.stats.RecordRead(*transferred);
         return STATUS_SUCCESS;
     });
 }
@@ -533,6 +536,7 @@ NTSTATUS Write(FSP_FILE_SYSTEM* fs, PVOID context, PVOID buffer,
         if (length) {
             auto bytes = std::span<const std::byte>(static_cast<const std::byte*>(buffer), length);
             *transferred = static_cast<ULONG>(state.pool.Write(name, offset, bytes));
+            state.stats.RecordWrite(*transferred);
         }
         return FillHandleInfo(state, handle, info);
     });
@@ -924,9 +928,11 @@ int main() {
         HANDLE reclaim_mutex = CreateMutexW(&event_attributes, FALSE,
             (reclaim_prefix + L"Mutex").c_str());
         const bool mutex_exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        const bool stats_ready = state->stats.Start(drive, &event_attributes);
         LocalFree(event_security);
         if (!reclaim_request || !reclaim_success || !reclaim_failure || !reclaim_mutex ||
-            request_exists || success_exists || failure_exists || mutex_exists) {
+            request_exists || success_exists || failure_exists || mutex_exists ||
+            !stats_ready) {
             if (reclaim_request) CloseHandle(reclaim_request);
             if (reclaim_success) CloseHandle(reclaim_success);
             if (reclaim_failure) CloseHandle(reclaim_failure);
@@ -936,7 +942,7 @@ int main() {
             FspFileSystemStopDispatcher(fs);
             FspFileSystemRemoveMountPoint(fs);
             FspFileSystemDelete(fs);
-            throw std::runtime_error("could not create checkpoint control events");
+            throw std::runtime_error("could not create PoolFS mount control and statistics objects");
         }
         SetConsoleCtrlHandler(ConsoleHandler, TRUE);
         std::wcout << L"PoolFS mounted at " << mount_point

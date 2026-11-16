@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manager"))
 
 from PySide6.QtCore import Qt, QTimer  # noqa: E402
-from PySide6.QtWidgets import QApplication, QFileDialog, QTableWidgetItem  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTableWidgetItem  # noqa: E402
 from app import MIB, ManagerWindow, validate_pool_name  # noqa: E402
 
 
@@ -35,6 +35,8 @@ def check_member_names(window: ManagerWindow) -> None:
     def queue(*rows: int) -> None:
         for row in rows:
             window.volumes_table.item(row, 0).setCheckState(Qt.CheckState.Checked)
+        assert window.queue_button.isEnabled()
+        assert window.queue_button.text().startswith(f"Continue with {len(rows)} volume")
         window.queue_volumes()
 
     def names() -> list[str]:
@@ -137,10 +139,51 @@ def check_image_size_controls(window: ManagerWindow) -> None:
         assert not window.size_input.isEnabled()
 
 
+def check_discovered_pool_flow(window: ManagerWindow) -> None:
+    first = str(Path(__file__).resolve())
+    second = str(Path(__file__).with_name("manager_startup_tests.py").resolve())
+    def image(path: str, index: int) -> dict[str, object]:
+        return {"path": path, "poolId": "pool-test-id", "memberIndex": index,
+                "memberCount": 2, "bytes": 384 * MIB, "encrypted": False}
+
+    window._on_images({"images": [image(first, 0)]})
+    assert not window.image_action.isEnabled()
+    window.images_table.selectRow(0)
+    assert not window.image_action.isEnabled()
+    assert "complete set" in window.image_selection.text()
+
+    window._on_images({"images": [image(first, 0), image(second, 1),
+                                  image(first + "-copy", 0)]})
+    window.images_table.selectRow(0)
+    assert not window.image_action.isEnabled()
+    assert "Multiple copies" in window.image_selection.text()
+
+    window._on_images({"images": [image(second, 1), image(first, 0)]})
+    assert not window.image_action.isEnabled()
+    window.images_table.selectRow(1)
+    assert window.image_action.isEnabled()
+    assert "All 2" in window.image_selection.text()
+    window.backend.mounted_drives = ["P:"]  # type: ignore[attr-defined]
+    with (patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+          patch.object(window, "_drive_available", side_effect=lambda drive: drive == "Q:")):
+        window.add_scanned_image()
+        assert window.drive_combo.currentText() == "Q:"
+        assert window.save_recovered_button.isEnabled()
+        window.drive_combo.setCurrentText("P:")
+        assert window.save_button.isEnabled(), "A recovered pool can save a new config on an occupied letter"
+    assert [member["path"] for member in window.members] == [first, second]
+    assert window.config_path is None
+    assert not window.mount_button.isEnabled()
+    assert window.pages.currentIndex() == 0
+    assert "save a config" in window.pool_guidance.text()
+    window.backend.mounted_drives = []  # type: ignore[attr-defined]
+
+
 def main() -> None:
     application = QApplication([])
     window = ManagerWindow(None, auto_refresh=False)
-    assert window.pool_name.text() == "New Pool"
+    window._drive_available = lambda _drive: True  # type: ignore[method-assign]
+    assert window.pool_name.text() == "PoolFS"
     assert not window.encrypt_check.isChecked()
     assert not window.require_check.isChecked()
     assert window.create_button.text() == "Create pool"
@@ -164,11 +207,28 @@ def main() -> None:
     saved: list[tuple[object, ...]] = []
 
     class FakeBackend:
+        mounted_drives: list[str] = []
+        stats_calls = 0
+
         def save_config(self, *arguments: object) -> dict[str, str]:
             saved.append(arguments)
             return {"path": str(arguments[0])}
 
-    window.backend = FakeBackend()  # type: ignore[assignment]
+        def mounts(self) -> dict[str, list[str]]:
+            return {"mountedDrives": self.mounted_drives}
+
+        def stats(self, drive: str) -> dict[str, int | str]:
+            self.stats_calls += 1
+            return {"drive": drive, "readBytes": self.stats_calls * MIB,
+                    "writeBytes": self.stats_calls * 2 * MIB,
+                    "readOperations": self.stats_calls,
+                    "writeOperations": self.stats_calls * 2,
+                    "uptimeMs": self.stats_calls * 1000,
+                    "capacityBytes": 10 * MIB,
+                    "availableBytes": 6 * MIB}
+
+    fake_backend = FakeBackend()
+    window.backend = fake_backend  # type: ignore[assignment]
     window.members = [{"path": str(Path(__file__).with_name("absent.img")),
                        "planned": False}]
     window.pool_name.setText("Travel Pool")
@@ -179,7 +239,63 @@ def main() -> None:
     assert saved == [(destination, "Travel Pool", "P:",
                       [str(Path(__file__).with_name("absent.img"))], False)]
     assert window._current_config()["name"] == "Travel Pool"
+    assert not any(button.isEnabled() for button in (
+        window.save_button, window.mount_button, window.verify_button,
+        window.grow_button, window.reclaim_button, window.unmount_button,
+    ))
+
+    image = str(Path(__file__))  # Existing file is sufficient for button state.
+    window.config_path = image  # The button state checks that the saved file still exists.
+    window.members = [{"path": image, "planned": False}]
+    window.config = {**window.config, "members": [image]}
+    window._refresh_members()
+    with (patch("app.startup_is_enabled", return_value=False),
+          patch("app.set_startup_enabled") as set_startup):
+        window._refresh_startup_option()
+        assert window.startup_check.isEnabled()
+        assert not window.startup_check.isChecked()
+        window.startup_check.setChecked(True)
+        set_startup.assert_called_once_with(image, True)
+        window.startup_check.setChecked(False)
+        assert set_startup.call_args_list[-1].args == (image, False)
+    assert all(button.isEnabled() for button in (
+        window.save_button, window.mount_button, window.verify_button,
+        window.grow_button,
+    ))
+    assert not window.reclaim_button.isEnabled()
+    assert not window.unmount_button.isEnabled()
+
+    fake_backend.mounted_drives = ["P:"]
+    window._refresh_mount_state()
+    assert not any(button.isEnabled() for button in (
+        window.save_button, window.mount_button, window.verify_button,
+        window.grow_button,
+    ))
+    assert window.reclaim_button.isEnabled()
+    assert window.unmount_button.isEnabled()
+    assert "P: already has a PoolFS mount" in window.pool_guidance.text()
+    window.pool_name.setText("Changed Pool")
+    assert not window.reclaim_button.isEnabled()
+    assert window.unmount_button.isEnabled()
+    window.pool_name.setText("Travel Pool")
+    fake_backend.mounted_drives = []
+    window._refresh_mount_state()
+    assert window.mount_button.isEnabled()
+    assert not window.unmount_button.isEnabled()
+
+    check_discovered_pool_flow(window)
     check_image_size_controls(window)
+    fake_backend.mounted_drives = ["P:"]
+    with patch("app.time.monotonic", side_effect=[100.0, 101.0]):
+        window._set_page("Stats")
+        window._poll_stats()
+    assert window.stats_drive.currentText() == "P:"
+    assert window.stats_read_rate.text() == "1.0 MiB/s"
+    assert window.stats_write_rate.text() == "2.0 MiB/s"
+    assert window.stats_total_read.text() == "2 MiB"
+    assert window.stats_usage.value() == 40
+    fake_backend.mounted_drives = []
+    window._set_page("Pool")
     events: list[bool] = []
     results: list[dict[str, bool]] = []
 

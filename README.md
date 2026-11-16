@@ -103,13 +103,20 @@ $env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
 
 The controller finds the other member in the seed image's folder and keeps
 the mount running after the command returns. Use `R:\` as a drive, then run
-`.\build\poolfsctl.exe reclaim R:` to rotate the recovery checkpoint and make
-retained space available to the mounted drive. The manager has a **Reclaim space**
-button for the same operation. This does not shrink member images. Run
+`.\build\poolfsctl.exe reclaim R:` to publish a new checkpoint and make
+space retained only by the old checkpoint available to the mounted drive. The
+**Reclaim space** button in the manager does the same thing. It does not shrink
+member image files. Run
 `.\build\poolfsctl.exe unmount R:` before removing any host volume. Choose an
 unused drive letter if `R:` is occupied. Direct `poolfs-mount.exe` remains
 available for a foreground mount. See [pool management](docs/pool-management.md)
 for discovery across volumes and controller status.
+
+Open **Stats** in the manager to see live read and write speeds, totals,
+operation counts, and available pool space. The same measurements are available
+from the command line with `.\build\poolfsctl.exe stats R:`; add `--watch` for
+continuous updates or `--json` for machine-readable output. These speeds count
+completed file reads and writes served by PoolFS, not physical disk traffic.
 
 For different member sizes, supply a size in MiB before each new image path:
 
@@ -182,8 +189,8 @@ The Python/Qt Windows manager shows host disks, partitions, volumes, PoolFS
 member images, and configs. Run `.\build\poolfs-manager.exe` beside the other
 built tools. It can create v6 image pools with individual member sizes, save a
 portable JSON config, mount and unmount, and verify an unmounted pool. Select
-one or more formatted host volumes on **Storage**, then **Add selected volumes
-to pool** to queue new member images on those partitions. Its built-in
+one or more formatted host volumes on **Storage**, then **Continue with N
+volumes** to queue new member images on those partitions. Its built-in
 partition controls require Administrator rights. See the [GUI guide](docs/gui.md).
 
 New pools in the manager start **unencrypted**. Select **Encrypt new pool**

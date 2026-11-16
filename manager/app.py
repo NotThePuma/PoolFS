@@ -7,11 +7,13 @@ import ctypes
 import os
 import shutil
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRegularExpression
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, QPoint, QThread, Signal, QTimer, QRegularExpression
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -22,13 +24,14 @@ from PySide6.QtWidgets import (
 )
 
 from backend import BridgeError, NativeBackend, PartitionRequest
+from startup import is_enabled as startup_is_enabled, set_enabled as set_startup_enabled
 
 
 MIB = 1024 * 1024
 MIN_IMAGE_MIB = 384
 MAX_IMAGE_MIB = ((1 << 63) - 1) // MIB
 MAX_SLIDER_STEPS = 1_000_000
-NEW_POOL_NAME = "New Pool"
+NEW_POOL_NAME = "PoolFS"
 STYLE = """
 QWidget { color: #edf3ff; font-family: "Segoe UI"; font-size: 12px; }
 QMainWindow, QWidget#root { background: #0b1220; }
@@ -146,6 +149,57 @@ def human_size(value: Any) -> str:
     return f"{number:,.0f} B"
 
 
+def human_rate(bytes_per_second: float) -> str:
+    if bytes_per_second >= MIB:
+        return f"{bytes_per_second / MIB:.1f} MiB/s"
+    if bytes_per_second >= 1024:
+        return f"{bytes_per_second / 1024:.1f} KiB/s"
+    return f"{bytes_per_second:.0f} B/s"
+
+
+class SpeedGraph(QWidget):
+    """A rolling view of filesystem throughput over the last 60 samples."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(180)
+        self.samples: list[tuple[float, float]] = []
+
+    def add_sample(self, read_rate: float, write_rate: float) -> None:
+        self.samples.append((read_rate, write_rate))
+        self.samples = self.samples[-60:]
+        self.update()
+
+    def clear(self) -> None:
+        self.samples.clear()
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#162438"))
+        left, top = 18, 16
+        width = max(1, self.width() - 36)
+        height = max(1, self.height() - 32)
+        painter.setPen(QPen(QColor("#30445e"), 1))
+        for fraction in (0.0, 0.5, 1.0):
+            y = top + int(height * fraction)
+            painter.drawLine(left, y, left + width, y)
+        peak = max((max(pair) for pair in self.samples), default=0.0)
+        ceiling = max(1024.0, peak * 1.1)
+        for column, color in ((0, "#77e5c1"), (1, "#73aaff")):
+            path = QPainterPath()
+            for index, sample in enumerate(self.samples):
+                x = left + width * index / 59
+                y = top + height * (1.0 - min(sample[column] / ceiling, 1.0))
+                if index == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+            painter.setPen(QPen(QColor(color), 2))
+            painter.drawPath(path)
+
+
 def validate_pool_name(name: str) -> str:
     try:
         units = len(name.encode("utf-16-le")) // 2
@@ -230,9 +284,12 @@ class ManagerWindow(QMainWindow):
         self.config_path: str | None = None
         self.members: list[dict[str, Any]] = []
         self.images: list[dict[str, Any]] = []
+        self._selected_image_group: list[dict[str, Any]] = []
         self._images_scanned = False
         self._tasks: set[Task] = set()
         self._running_operation = False
+        self._mounted_drives: set[str] | None = None
+        self._stats_previous: dict[str, tuple[float, int, int, int]] = {}
         self.setWindowTitle("PoolFS Manager")
         self.resize(1320, 870)
         self.setMinimumSize(1050, 690)
@@ -240,6 +297,12 @@ class ManagerWindow(QMainWindow):
         self._size_validation_timer = QTimer(self)
         self._size_validation_timer.setSingleShot(True)
         self._size_validation_timer.timeout.connect(self._refresh_create_button)
+        self._mount_state_timer = QTimer(self)
+        self._mount_state_timer.timeout.connect(self._refresh_mount_state)
+        self._mount_state_timer.start(2500)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.timeout.connect(self._poll_stats)
+        self._stats_timer.start(1000)
         self._set_page("Pool")
         self._refresh_members()
         if auto_refresh:
@@ -279,7 +342,8 @@ class ManagerWindow(QMainWindow):
         side.addSpacing(29)
         side.addWidget(label("WORKSPACE", "micro"))
         self.nav: dict[str, QPushButton] = {}
-        for name, glyph in (("Pool", "◉"), ("Storage", "▦"), ("Images", "▤")):
+        for name, glyph in (("Pool", "◉"), ("Storage", "▦"),
+                            ("Images", "▤"), ("Stats", "▥")):
             item = QPushButton(f"{glyph}    {name}")
             item.setObjectName("nav")
             item.setCheckable(True)
@@ -287,18 +351,9 @@ class ManagerWindow(QMainWindow):
             side.addWidget(item)
             self.nav[name] = item
         side.addStretch()
-        about, about_box = card()
-        about_box.addWidget(label("POOL FORMAT", "micro"))
-        about_box.addWidget(label("v6 · image-backed pools"))
-        about_box.addWidget(label("All members required to mount", "muted", True))
-        winfsp_notice = label(
-            'WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos<br>'
-            '<a href="https://github.com/winfsp/winfsp">WinFsp source</a>',
-            "muted", True,
-        )
-        winfsp_notice.setOpenExternalLinks(True)
-        about_box.addWidget(winfsp_notice)
-        side.addWidget(about)
+        about_button = button("About PoolFS", self._show_about)
+        about_button.setObjectName("nav")
+        side.addWidget(about_button)
         body.addWidget(sidebar)
 
         main = QWidget()
@@ -323,6 +378,7 @@ class ManagerWindow(QMainWindow):
         self.pages.addWidget(self._build_pool_page())
         self.pages.addWidget(self._build_storage_page())
         self.pages.addWidget(self._build_images_page())
+        self.pages.addWidget(self._build_stats_page())
         body.addWidget(main, 1)
 
         status_frame = QFrame()
@@ -340,7 +396,7 @@ class ManagerWindow(QMainWindow):
         self.create_progress.setRange(0, 0)
         self.create_progress.hide()
         status_box.addWidget(self.create_progress)
-        status_box.addWidget(label("PoolFS  •  local only", "micro"))
+        status_box.addWidget(label("PoolFS v6  •  local only", "micro"))
         shell.addWidget(status_frame)
 
     def _scroll_page(self, content: QWidget) -> QScrollArea:
@@ -348,6 +404,29 @@ class ManagerWindow(QMainWindow):
         area.setWidgetResizable(True)
         area.setWidget(content)
         return area
+
+    def _show_about(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("About PoolFS")
+        dialog.setMinimumWidth(420)
+        box = QVBoxLayout(dialog)
+        box.setContentsMargins(24, 22, 24, 20)
+        box.setSpacing(12)
+        box.addWidget(label("PoolFS Manager", "section"))
+        box.addWidget(label("v6 · image-backed pools", "muted"))
+        box.addWidget(label("All member images are required to mount a pool.", "muted", True))
+        box.addSpacing(10)
+        box.addWidget(label("WinFsp attribution", "micro"))
+        winfsp_notice = label(
+            'WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos<br>'
+            '<a href="https://github.com/winfsp/winfsp">WinFsp source</a>',
+            "muted", True,
+        )
+        winfsp_notice.setOpenExternalLinks(True)
+        box.addWidget(winfsp_notice)
+        close_button = button("Close", dialog.accept)
+        box.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
 
     def _build_pool_page(self) -> QScrollArea:
         content = QWidget()
@@ -364,9 +443,18 @@ class ManagerWindow(QMainWindow):
         detail.addWidget(self.config_name)
         self.config_location = label("Open a JSON config or select host volumes to start a new pool.", "muted", True)
         detail.addWidget(self.config_location)
+        self.pool_guidance = label("Choose host volumes to create a pool, or open a saved config.", "muted", True)
+        self.pool_guidance.setStyleSheet("color:#77e5c1;")
+        detail.addWidget(self.pool_guidance)
         top.addLayout(detail, 1)
+        self.choose_volumes_button = button(
+            "Choose host volumes", lambda: self._set_page("Storage"), True
+        )
+        top.addWidget(self.choose_volumes_button)
+        self.save_recovered_button = button("Save config to mount", self.save_config, True)
+        top.addWidget(self.save_recovered_button)
         top.addWidget(button("New pool", self.new_pool))
-        top.addWidget(button("Open config", self.open_config, True))
+        top.addWidget(button("Open config", self.open_config))
         current_box.addLayout(top)
         layout.addWidget(current)
 
@@ -375,14 +463,23 @@ class ManagerWindow(QMainWindow):
         members_card, members_box = card()
         members_box.addWidget(label("Member images", "section"))
         members_box.addWidget(label("One image file per selected host volume. A complete pool needs all members.", "muted", True))
+        self.member_empty = label(
+            "No member images yet.\nChoose host volumes above, or add an existing image.",
+            "muted", True,
+        )
+        self.member_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.member_empty.setMinimumHeight(155)
+        members_box.addWidget(self.member_empty)
         self.members_table = table(["Image path", "Size", "State"])
         self.members_table.setFixedHeight(220)
         self.members_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.members_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.members_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.members_table.itemSelectionChanged.connect(self._refresh_size_editor)
+        self.members_table.itemSelectionChanged.connect(self._refresh_member_controls)
         members_box.addWidget(self.members_table)
         size_frame = QFrame()
+        self.size_frame = size_frame
         size_frame.setObjectName("metricCard")
         size_box = QVBoxLayout(size_frame)
         size_box.setContentsMargins(16, 14, 16, 14)
@@ -414,12 +511,13 @@ class ManagerWindow(QMainWindow):
         size_box.addWidget(self.size_maximum)
         members_box.addWidget(size_frame)
         controls = QHBoxLayout()
-        controls.addWidget(button("Add existing…", self.add_existing_image))
-        controls.addWidget(button("New image path…", self.add_new_image_path))
-        controls.addWidget(button("Remove", self.remove_selected_member))
+        self.add_existing_button = button("Add existing…", self.add_existing_image)
+        self.new_image_button = button("New image path…", self.add_new_image_path)
+        self.remove_member_button = button("Remove", self.remove_selected_member)
+        for item in (self.add_existing_button, self.new_image_button, self.remove_member_button):
+            controls.addWidget(item)
         controls.addStretch()
         members_box.addLayout(controls)
-        members_box.addStretch(1)
         columns.addWidget(members_card, 1)
         side = QVBoxLayout()
         side.setSpacing(16)
@@ -431,11 +529,14 @@ class ManagerWindow(QMainWindow):
         self.pool_name.setMaxLength(32)
         self.pool_name.setPlaceholderText("Name this pool")
         self.pool_name.textChanged.connect(lambda _text: self._refresh_pool_identity())
+        self.pool_name.textChanged.connect(self._refresh_create_button)
+        self.pool_name.textChanged.connect(self._refresh_pool_actions)
         details_box.addWidget(self.pool_name)
         details_box.addWidget(label("MOUNT DRIVE", "micro"))
         self.drive_combo = QComboBox()
         self.drive_combo.addItems([f"{chr(code)}:" for code in range(ord("D"), ord("Z") + 1)])
         self.drive_combo.setCurrentText("P:")
+        self.drive_combo.currentTextChanged.connect(self._refresh_pool_actions)
         details_box.addWidget(self.drive_combo)
         self.encrypt_check = QCheckBox("Encrypt new pool")
         self.encrypt_check.setChecked(False)
@@ -447,21 +548,20 @@ class ManagerWindow(QMainWindow):
         details_box.addWidget(self.encryption_note)
         self.require_check = QCheckBox("Require encryption when mounting")
         self.require_check.setChecked(False)
+        self.require_check.toggled.connect(self._refresh_pool_actions)
         details_box.addWidget(self.require_check)
+        self.startup_check = QCheckBox("Mount when I sign in to Windows")
+        self.startup_check.setToolTip(
+            "Starts this pool at your Windows sign-in. Encrypted pools ask for the password."
+        )
+        self.startup_check.toggled.connect(self._startup_changed)
+        details_box.addWidget(self.startup_check)
         self.member_count = label("0 members", "muted")
         details_box.addWidget(self.member_count)
         side.addWidget(details)
-        next_card, next_box = card(accent=True)
-        next_box.addWidget(label("Create a new pool", "section"))
-        next_box.addWidget(label(
-            "Choose one or more formatted host volumes on Storage. "
-            "PoolFS will place a new image on each selected volume.", "muted", True
-        ))
-        next_box.addWidget(button("Choose host volumes  →", lambda: self._set_page("Storage"), True))
-        side.addWidget(next_card)
-        side.addStretch()
         columns.addLayout(side)
         actions, actions_box = card()
+        self.actions_card = actions
         row = QHBoxLayout()
         self.create_button = button("Create pool", self.create_pool, True)
         self.grow_button = button("Grow images…", self.grow_images)
@@ -477,7 +577,8 @@ class ManagerWindow(QMainWindow):
         row.addStretch()
         actions_box.addLayout(row)
         layout.addWidget(actions)
-        layout.addLayout(columns, 1)
+        layout.addLayout(columns)
+        layout.addStretch(1)
         return self._scroll_page(content)
 
     def _metric(self, title: str) -> tuple[QFrame, QLabel]:
@@ -497,9 +598,9 @@ class ManagerWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 10, 5)
         layout.setSpacing(16)
         toolbar = QHBoxLayout()
-        toolbar.addWidget(label("Host partitions hold PoolFS image files. Disk layout tools are separate.", "muted", True), 1)
+        toolbar.addWidget(label("Choose formatted host volumes to create a pool. Disk tools are below.", "muted", True), 1)
         toolbar.addWidget(button("Refresh storage", self.refresh_inventory))
-        toolbar.addWidget(button("Run as admin", self.restart_as_admin))
+        toolbar.addWidget(button("Disk tools  ↓", self._scroll_to_partition_tools))
         layout.addLayout(toolbar)
         metrics = QHBoxLayout()
         metrics.setSpacing(12)
@@ -533,7 +634,12 @@ class ManagerWindow(QMainWindow):
         lists.addWidget(part_card, 1)
         layout.addLayout(lists)
         partition_actions, partition_box = card()
-        partition_box.addWidget(label("Partition tools", "section"))
+        self.partition_actions = partition_actions
+        partition_heading = QHBoxLayout()
+        partition_heading.addWidget(label("Partition tools", "section"), 1)
+        self.admin_button = button("Run as admin", self.restart_as_admin)
+        partition_heading.addWidget(self.admin_button)
+        partition_box.addLayout(partition_heading)
         self.partition_notice = label(
             "Changes require Administrator and all PoolFS drives unmounted. "
             "The target is previewed and confirmed before any write.", "muted", True
@@ -557,16 +663,16 @@ class ManagerWindow(QMainWindow):
         description = QVBoxLayout()
         description.addWidget(label("Host volumes", "section"))
         description.addWidget(label(
-            "Tick each formatted volume that should hold a new member image.",
+            "Select 1–16 formatted volumes. One member image will be created on each after review.",
             "muted", True
         ))
         header.addLayout(description, 1)
-        self.queue_button = button("Add selected volumes to pool", self.queue_volumes, True)
+        self.queue_button = button("Select host volumes", self.queue_volumes, True)
         self.queue_button.setEnabled(False)
         header.addWidget(self.queue_button)
         volumes_box.addLayout(header)
         self.volumes_table = table(["Use", "Mount path", "File system", "Free", "Disk / part", "Label"])
-        self.volumes_table.setMinimumHeight(225)
+        self.volumes_table.setFixedHeight(120)
         self.volumes_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.volumes_table.itemChanged.connect(self._volume_selection_changed)
         self.volumes_table.cellClicked.connect(self._volume_cell_clicked)
@@ -574,7 +680,15 @@ class ManagerWindow(QMainWindow):
         self.volume_selection = label("No host volumes selected.", "muted")
         volumes_box.addWidget(self.volume_selection)
         layout.insertWidget(2, volumes_card)
-        return self._scroll_page(content)
+        self.storage_scroll = self._scroll_page(content)
+        return self.storage_scroll
+
+    def _scroll_to_partition_tools(self) -> None:
+        QTimer.singleShot(
+            0, lambda: self.storage_scroll.verticalScrollBar().setValue(
+                self.partition_actions.mapTo(self.storage_scroll.widget(), QPoint(0, 0)).y()
+            ),
+        )
 
     def _build_images_page(self) -> QScrollArea:
         content = QWidget()
@@ -594,16 +708,89 @@ class ManagerWindow(QMainWindow):
         image_card, image_box = card()
         self.image_count = label("No scan yet", "muted")
         image_box.addWidget(self.image_count)
-        self.images_table = table(["Image path", "Size", "Pool ID", "Member", "Encrypted"])
-        self.images_table.setMinimumHeight(390)
+        self.images_table = table(["Image path", "Size", "Pool", "Member", "Encrypted"])
+        self.images_table.setFixedHeight(120)
+        self.images_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.images_table.itemSelectionChanged.connect(self._refresh_image_action)
         image_box.addWidget(self.images_table)
-        image_box.addWidget(button("Add selected image to Pool", self.add_scanned_image))
+        self.image_selection = label("Select an image to see whether its complete pool is here.", "muted", True)
+        image_box.addWidget(self.image_selection)
+        self.image_action = button("Select an image", self.add_scanned_image, True)
+        self.image_action.setEnabled(False)
+        image_box.addWidget(self.image_action)
         layout.addWidget(image_card)
         layout.addStretch()
         return self._scroll_page(content)
 
+    def _build_stats_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("page")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 10, 5)
+        layout.setSpacing(16)
+        heading, heading_box = card()
+        row = QHBoxLayout()
+        detail = QVBoxLayout()
+        detail.addWidget(label("Live pool activity", "section"))
+        detail.addWidget(label(
+            "Completed file reads and writes served to Windows. Rates update each second.",
+            "muted", True,
+        ))
+        row.addLayout(detail, 1)
+        row.addWidget(label("MOUNTED DRIVE", "micro"))
+        self.stats_drive = QComboBox()
+        self.stats_drive.setMinimumWidth(95)
+        self.stats_drive.currentTextChanged.connect(self._stats_drive_changed)
+        row.addWidget(self.stats_drive)
+        row.addWidget(button("Refresh", self._refresh_stats))
+        heading_box.addLayout(row)
+        self.stats_status = label("Mount a pool to see live statistics.", "muted", True)
+        heading_box.addWidget(self.stats_status)
+        layout.addWidget(heading)
+
+        rates = QHBoxLayout()
+        read_card, self.stats_read_rate = self._metric("READ SPEED")
+        write_card, self.stats_write_rate = self._metric("WRITE SPEED")
+        rates.addWidget(read_card, 1)
+        rates.addWidget(write_card, 1)
+        layout.addLayout(rates)
+
+        graph_card, graph_box = card()
+        graph_box.addWidget(label("Recent speed · last 60 seconds", "section"))
+        graph_box.addWidget(label(
+            '<span style="color:#77e5c1">● Read</span> &nbsp;&nbsp; '
+            '<span style="color:#73aaff">● Write</span>', "muted"
+        ))
+        self.stats_graph = SpeedGraph()
+        graph_box.addWidget(self.stats_graph)
+        layout.addWidget(graph_card)
+
+        totals = QHBoxLayout()
+        for title, attribute in (
+            ("TOTAL READ", "stats_total_read"),
+            ("TOTAL WRITTEN", "stats_total_write"),
+            ("READ OPERATIONS", "stats_read_ops"),
+            ("WRITE OPERATIONS", "stats_write_ops"),
+        ):
+            frame, value = self._metric(title)
+            setattr(self, attribute, value)
+            totals.addWidget(frame, 1)
+        layout.addLayout(totals)
+
+        capacity_card, capacity_box = card()
+        capacity_box.addWidget(label("Pool space", "section"))
+        self.stats_capacity = label("Mount a pool to see its available space.", "muted")
+        capacity_box.addWidget(self.stats_capacity)
+        self.stats_usage = QProgressBar()
+        self.stats_usage.setRange(0, 100)
+        capacity_box.addWidget(self.stats_usage)
+        layout.addWidget(capacity_card)
+        layout.addStretch(1)
+        self._clear_stats()
+        return self._scroll_page(content)
+
     def _set_page(self, name: str) -> None:
-        pages = {"Pool": 0, "Storage": 1, "Images": 2}
+        pages = {"Pool": 0, "Storage": 1, "Images": 2, "Stats": 3}
         self.pages.setCurrentIndex(pages[name])
         page = self.pages.widget(pages[name])
         if isinstance(page, QScrollArea):
@@ -613,12 +800,15 @@ class ManagerWindow(QMainWindow):
             "Pool": "Create a pool or open an existing config.",
             "Storage": "Choose host volumes for images, or inspect your disks.",
             "Images": "Find existing PoolFS member images on this machine.",
+            "Stats": "Watch activity and space on a mounted pool.",
         }
         self.page_subtitle.setText(subtitles[name])
         for title, control in self.nav.items():
             control.setChecked(title == name)
         if name == "Images" and not self._images_scanned:
             self.scan_images()
+        if name == "Stats":
+            self._refresh_stats()
 
     def _message(self, text: str) -> None:
         self.status.setText(text)
@@ -629,7 +819,11 @@ class ManagerWindow(QMainWindow):
         if self.config_path or self.members:
             self.config_name.setText(self.pool_name.text() or "Unnamed pool")
             self.config_location.setText(
-                self.config_path or "Unsaved pool draft · choose host volumes and create images."
+                self.config_path or (
+                    "Unsaved new pool · set sizes and create images."
+                    if any(member.get("planned") for member in self.members)
+                    else "Existing member images · save a config to mount."
+                )
             )
         else:
             self.config_name.setText("No pool selected")
@@ -683,6 +877,7 @@ class ManagerWindow(QMainWindow):
             if show_progress:
                 self.create_progress.hide()
             self.centralWidget().setEnabled(True)
+            self._refresh_mount_state()
 
         def succeeded(result: Any) -> None:
             finish()
@@ -759,6 +954,7 @@ class ManagerWindow(QMainWindow):
         self.partition_context.setText("Choose a disk on the left.")
         self.volumes_table.blockSignals(True)
         self.volumes_table.setRowCount(len(self.host_volumes))
+        self.volumes_table.setFixedHeight(min(360, max(120, 43 + len(self.host_volumes) * 38)))
         for row, volume in enumerate(self.host_volumes):
             paths = volume.get("mountPaths") or []
             mount = next((p for p in paths if len(p) >= 2 and p[1] == ":"), None)
@@ -789,6 +985,8 @@ class ManagerWindow(QMainWindow):
         self.volumes_table.blockSignals(False)
         self.volume_selection.setText("No host volumes selected.")
         self.queue_button.setEnabled(False)
+        self.queue_button.setText("Select host volumes")
+        self.admin_button.setEnabled(not bool(data.get("partitionElevated")))
         self._update_partition_buttons()
         self._message(f"Ready · {len(disks)} disks · {len(volumes)} volumes")
 
@@ -856,11 +1054,29 @@ class ManagerWindow(QMainWindow):
 
     def _volume_selection_changed(self) -> None:
         rows = self._checked_volume_rows()
-        self.queue_button.setEnabled(bool(rows))
+        replacing = bool(self.config_path) or any(not member.get("planned") for member in self.members)
+        remaining = 16 if replacing else 16 - len(self.members)
+        valid = bool(rows) and len(rows) <= remaining
+        self.queue_button.setEnabled(valid)
+        self.queue_button.setText(
+            "Too many volumes" if len(rows) > remaining else
+            f"Continue with {len(rows)} volume{'s' if len(rows) != 1 else ''}  →"
+            if rows else "Select host volumes"
+        )
         self.volume_selection.setText(
+            f"Select no more than {remaining} host volume{'s' if remaining != 1 else ''} for this pool."
+            if len(rows) > remaining else
             f"{len(rows)} host volume{'s' if len(rows) != 1 else ''} selected. "
             "One new image will be queued on each."
             if rows else "No host volumes selected."
+        )
+
+    def _refresh_member_controls(self) -> None:
+        room = len(self.members) < 16
+        self.add_existing_button.setEnabled(room)
+        self.new_image_button.setEnabled(room)
+        self.remove_member_button.setEnabled(
+            bool(self.members_table.selectionModel().selectedRows())
         )
 
     def _member_host(self, member: dict[str, Any]) -> tuple[str, str, str]:
@@ -940,11 +1156,225 @@ class ManagerWindow(QMainWindow):
             return False
 
     def _refresh_create_button(self) -> None:
+        try:
+            validate_pool_name(self.pool_name.text())
+            valid_name = True
+        except ValueError:
+            valid_name = False
         planned = [member for member in self.members if member.get("planned")]
         self.create_button.setEnabled(
-            bool(planned) and len(planned) == len(self.members) and
+            self.backend is not None and valid_name and bool(planned) and
+            len(planned) == len(self.members) and
             not any(Path(str(member["path"])).exists() for member in planned) and
             self._planned_sizes_fit()
+        )
+
+    def _refresh_mount_state(self) -> None:
+        if self.backend is None:
+            self._mounted_drives = None
+        else:
+            try:
+                drives = self.backend.mounts().get("mountedDrives", [])
+                self._mounted_drives = {str(drive).upper() for drive in drives}
+            except Exception:
+                # An unknown mount state must not enable a destructive or offline action.
+                self._mounted_drives = None
+        self._refresh_pool_actions()
+        self._refresh_stats_drives()
+
+    def _clear_stats(self) -> None:
+        for value in (self.stats_read_rate, self.stats_write_rate,
+                      self.stats_total_read, self.stats_total_write,
+                      self.stats_read_ops, self.stats_write_ops):
+            value.setText("—")
+        self.stats_capacity.setText("Mount a pool to see its available space.")
+        self.stats_usage.setValue(0)
+        self.stats_graph.clear()
+
+    def _stats_drive_changed(self) -> None:
+        self._clear_stats()
+        drive = self.stats_drive.currentText()
+        if drive:
+            self._stats_previous.pop(drive, None)
+            self.stats_status.setText("Measuring activity on " + drive + "…")
+        else:
+            self.stats_status.setText("Mount a pool to see live statistics.")
+
+    def _refresh_stats_drives(self) -> None:
+        if not hasattr(self, "stats_drive"):
+            return
+        drives = sorted(self._mounted_drives or [])
+        selected = self.stats_drive.currentText()
+        if drives == [self.stats_drive.itemText(i) for i in range(self.stats_drive.count())]:
+            self.stats_drive.setEnabled(bool(drives))
+            if not drives and self._mounted_drives is None:
+                self.stats_status.setText("Could not inspect mounted pools. Try Refresh.")
+            return
+        self.stats_drive.blockSignals(True)
+        self.stats_drive.clear()
+        self.stats_drive.addItems(drives)
+        if selected in drives:
+            self.stats_drive.setCurrentText(selected)
+        self.stats_drive.blockSignals(False)
+        self.stats_drive.setEnabled(bool(drives))
+        if self.stats_drive.currentText() != selected:
+            self._stats_drive_changed()
+        if not drives and self._mounted_drives is None:
+            self.stats_status.setText("Could not inspect mounted pools. Try Refresh.")
+
+    def _refresh_stats(self) -> None:
+        self._refresh_mount_state()
+        self._poll_stats()
+
+    def _poll_stats(self) -> None:
+        if self.pages.currentIndex() != 3 or self.backend is None:
+            return
+        drive = self.stats_drive.currentText()
+        if not drive:
+            return
+        try:
+            sample = self.backend.stats(drive)
+        except Exception as exc:
+            self._clear_stats()
+            self.stats_status.setText(str(exc))
+            return
+        now = time.monotonic()
+        read_bytes = int(sample["readBytes"])
+        write_bytes = int(sample["writeBytes"])
+        uptime = int(sample["uptimeMs"])
+        prior = self._stats_previous.get(drive)
+        read_rate = write_rate = 0.0
+        if prior and uptime >= prior[3] and read_bytes >= prior[1] and write_bytes >= prior[2]:
+            elapsed = now - prior[0]
+            if elapsed >= 0.05:
+                read_rate = (read_bytes - prior[1]) / elapsed
+                write_rate = (write_bytes - prior[2]) / elapsed
+        elif prior:
+            self.stats_graph.clear()  # The drive was remounted; counters restarted.
+        self._stats_previous[drive] = (now, read_bytes, write_bytes, uptime)
+        self.stats_read_rate.setText(human_rate(read_rate) if prior else "Measuring…")
+        self.stats_write_rate.setText(human_rate(write_rate) if prior else "Measuring…")
+        self.stats_total_read.setText(human_size(read_bytes))
+        self.stats_total_write.setText(human_size(write_bytes))
+        self.stats_read_ops.setText(f"{int(sample['readOperations']):,}")
+        self.stats_write_ops.setText(f"{int(sample['writeOperations']):,}")
+        capacity = int(sample["capacityBytes"])
+        available = int(sample["availableBytes"])
+        used = max(0, capacity - available)
+        self.stats_capacity.setText(
+            f"{human_size(used)} used · {human_size(available)} available · "
+            f"{human_size(capacity)} total"
+        )
+        self.stats_usage.setValue(min(100, int(used * 100 / capacity)) if capacity else 0)
+        self.stats_graph.add_sample(read_rate, write_rate)
+        hours, remainder = divmod(uptime // 1000, 3600)
+        minutes = remainder // 60
+        self.stats_status.setText(
+            f"Updated {datetime.now():%H:%M:%S} · mounted for {hours}h {minutes}m · "
+            "rates are completed file I/O, excluding metadata and physical disk traffic."
+        )
+
+    @staticmethod
+    def _drive_available(drive: str) -> bool:
+        if os.name != "nt":
+            return True
+        get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+        get_drive_type.argtypes = [ctypes.c_wchar_p]
+        get_drive_type.restype = ctypes.c_uint
+        return get_drive_type(f"{drive[0]}:\\") == 1
+
+    def _suggest_free_drive(self) -> str:
+        drives = ["P:"] + [f"{chr(code)}:" for code in range(ord("D"), ord("Z") + 1)
+                            if code != ord("P")]
+        return next((drive for drive in drives if self._drive_available(drive)), "P:")
+
+    def _refresh_pool_actions(self) -> None:
+        if not hasattr(self, "create_button"):
+            return
+        drive = self.drive_combo.currentText().upper()
+        mounted = self._mounted_drives is not None and drive in self._mounted_drives
+        unmounted = self._mounted_drives is not None and not mounted
+        drive_available = self._drive_available(drive)
+        existing = bool(self.members) and all(
+            not member.get("planned") and Path(str(member["path"])).is_file()
+            for member in self.members
+        )
+        current = {
+            "name": self.pool_name.text(),
+            "drive": self.drive_combo.currentText(),
+            "requireEncrypted": self.require_check.isChecked(),
+            "members": [str(member["path"]) for member in self.members],
+        }
+        try:
+            valid_name = bool(validate_pool_name(self.pool_name.text()))
+        except ValueError:
+            valid_name = False
+        saved = bool(self.config_path and Path(self.config_path).is_file()) and current == self.config
+        ready = self.backend is not None and existing and saved
+        can_save = (self.backend is not None and existing and valid_name and
+                    (not self.config_path or unmounted))
+        self.save_button.setEnabled(can_save)
+        self.save_recovered_button.setVisible(existing and not self.config_path)
+        self.save_recovered_button.setEnabled(can_save)
+        self.actions_card.setVisible(bool(self.config_path) or any(
+            member.get("planned") for member in self.members
+        ))
+        self.mount_button.setEnabled(ready and unmounted and drive_available)
+        self.verify_button.setEnabled(ready and unmounted)
+        self.grow_button.setEnabled(ready and unmounted)
+        self.reclaim_button.setEnabled(ready and mounted)
+        self.unmount_button.setEnabled(self.backend is not None and mounted)
+        if not self.members:
+            guidance = "To create a pool, choose host volumes. To open one, select its saved config."
+        elif any(member.get("planned") for member in self.members):
+            guidance = (
+                "A new pool cannot mix existing and new images. Start a new pool draft."
+                if not all(member.get("planned") for member in self.members) else
+                "Next: select each new image to set its size, then create the pool."
+            )
+        elif not existing:
+            missing = sum(not Path(str(member["path"])).is_file() for member in self.members)
+            guidance = f"{missing} member image{'s' if missing != 1 else ''} missing. Connect its host volume or update the path."
+        elif not self.config_path:
+            guidance = "Member images are ready. Name the pool, then save a config to mount."
+        elif not saved:
+            guidance = "Config or member details changed. Save a config before mounting."
+        elif mounted:
+            guidance = f"{drive} already has a PoolFS mount. Choose a free letter or unmount it."
+        elif unmounted and not drive_available:
+            guidance = f"{drive} is already in use. Choose a free drive letter before mounting."
+        elif unmounted:
+            guidance = f"Ready to mount on {drive}. All member images are present."
+        else:
+            guidance = "Checking whether this pool is mounted…"
+        self.pool_guidance.setText(guidance)
+
+    def _refresh_startup_option(self) -> None:
+        path = self.config_path
+        available = (os.name == "nt" and self.backend is not None and
+                     bool(path and Path(path).is_file()))
+        self.startup_check.blockSignals(True)
+        try:
+            self.startup_check.setChecked(bool(path and startup_is_enabled(path)))
+            self.startup_check.setEnabled(available)
+        except OSError:
+            self.startup_check.setChecked(False)
+            self.startup_check.setEnabled(False)
+        finally:
+            self.startup_check.blockSignals(False)
+
+    def _startup_changed(self, enabled: bool) -> None:
+        if not self.config_path:
+            return
+        try:
+            set_startup_enabled(self.config_path, enabled)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._refresh_startup_option()
+            self._error(str(exc))
+            return
+        self._message(
+            "This pool will mount when you sign in to Windows."
+            if enabled else "Automatic mount at sign-in is off for this pool."
         )
 
     def _slider_value_for_size(self, size_mib: int, maximum: int) -> int:
@@ -1086,6 +1516,8 @@ class ManagerWindow(QMainWindow):
 
     def _refresh_members(self) -> None:
         selected_row = self.members_table.currentRow()
+        self.member_empty.setVisible(not bool(self.members))
+        self.members_table.setVisible(bool(self.members))
         self.members_table.blockSignals(True)
         self.members_table.setRowCount(len(self.members))
         for row, member in enumerate(self.members):
@@ -1109,10 +1541,17 @@ class ManagerWindow(QMainWindow):
             self.members_table.selectRow(selected_row)
         self.members_table.blockSignals(False)
         self._refresh_size_editor()
+        self._refresh_member_controls()
         self.member_count.setText(f"{len(self.members)} of 16 member images")
         self._refresh_pool_identity()
+        self._refresh_startup_option()
         planned = [m for m in self.members if m.get("planned")]
+        self.size_frame.setVisible(bool(planned))
         existing = len(self.members) - len(planned)
+        self.choose_volumes_button.setVisible(not existing)
+        self.choose_volumes_button.setText(
+            "Add host volumes" if planned else "Choose host volumes"
+        )
         self.encrypt_check.setVisible(not existing)
         if existing:
             self.encryption_note.setText(
@@ -1131,10 +1570,7 @@ class ManagerWindow(QMainWindow):
             )
         self.require_check.setEnabled(not planned)
         self._refresh_create_button()
-        self.grow_button.setEnabled(bool(self.config_path) and bool(self.members) and not planned)
-        for item in (self.save_button, self.mount_button, self.verify_button):
-            item.setEnabled(bool(self.members) and not planned)
-        self.reclaim_button.setEnabled(bool(self.config_path) and bool(self.members) and not planned)
+        self._refresh_mount_state()
 
     def _same_mount(self, path: str, expected: str) -> bool:
         if os.name != "nt":
@@ -1257,6 +1693,12 @@ class ManagerWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open PoolFS config", "", "JSON files (*.json)")
         if not path:
             return
+        self.load_config_path(path)
+
+    def load_config_path(self, path: str) -> bool:
+        if self.backend is None:
+            self._error("Native PoolFS bridge is unavailable.")
+            return False
         try:
             config = self.backend.load_config(path)
             self.config = config
@@ -1271,8 +1713,10 @@ class ManagerWindow(QMainWindow):
             self._refresh_members()
             self._set_page("Pool")
             self._message(f"Opened {Path(path).name}")
+            return True
         except Exception as exc:
             self._error(str(exc))
+            return False
 
     def add_existing_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select PoolFS image", "", "Images (*.img);;All files (*)")
@@ -1313,17 +1757,69 @@ class ManagerWindow(QMainWindow):
             self._refresh_members()
 
     def add_scanned_image(self) -> None:
-        row = self.images_table.currentRow()
-        if 0 <= row < len(self.images):
-            image = self.images[row]
-            path = str(image["path"])
-            if not any(str(m["path"]).casefold() == path.casefold() for m in self.members):
-                if len(self.members) >= 16:
-                    self._error("A pool supports at most 16 images.")
-                    return
-                self.members.append({"path": path, "planned": False})
-                self._refresh_members()
-            self._set_page("Pool")
+        group = self._selected_image_group
+        if not group:
+            return
+        paths = [str(image["path"]) for image in group]
+        current_paths = [str(member["path"]) for member in self.members]
+        if ([path.casefold() for path in paths] !=
+                [path.casefold() for path in current_paths] or
+                any(member.get("planned") for member in self.members)):
+            if self.members and QMessageBox.question(
+                self, "Use discovered pool",
+                "Replace the current pool selection with these discovered members? "
+                "No image files or saved configs will be changed."
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self.members = [{"path": path, "planned": False} for path in paths]
+            self.config = None
+            self.config_path = None
+            self.pool_name.setText(NEW_POOL_NAME)
+            self.drive_combo.setCurrentText(self._suggest_free_drive())
+            self.require_check.setChecked(bool(group[0].get("encrypted")))
+            self._refresh_members()
+        self._set_page("Pool")
+        self._message(f"Loaded {len(group)} member image(s). Name the pool and save a config.")
+
+    def _refresh_image_action(self) -> None:
+        selected_rows = self.images_table.selectionModel().selectedRows()
+        row = selected_rows[0].row() if selected_rows else -1
+        self._selected_image_group = []
+        if not 0 <= row < len(self.images):
+            self.image_selection.setText("Select an image to see whether its complete pool is here.")
+            self.image_action.setText("Select an image")
+            self.image_action.setEnabled(False)
+            return
+        selected = self.images[row]
+        pool_id = str(selected.get("poolId") or "")
+        group = ([image for image in self.images if str(image.get("poolId") or "") == pool_id]
+                 if pool_id else [selected])
+        try:
+            expected = int(selected.get("memberCount", 0))
+            indexes = {int(image.get("memberIndex", -1)) for image in group}
+        except (TypeError, ValueError):
+            expected, indexes = 0, set()
+        complete = (
+            1 <= expected <= 16 and len(group) == expected and
+            indexes == set(range(expected)) and
+            len({str(image.get("path", "")).casefold() for image in group}) == expected and
+            len({bool(image.get("encrypted")) for image in group}) == 1 and
+            all(Path(str(image.get("path", ""))).is_file() for image in group)
+        )
+        if complete:
+            self._selected_image_group = sorted(group, key=lambda image: int(image["memberIndex"]))
+            self.image_selection.setText(
+                f"All {expected} member image{'s' if expected != 1 else ''} found for this pool."
+            )
+            self.image_action.setText("Load complete pool  →")
+        else:
+            self.image_selection.setText(
+                "Multiple copies of this pool were found. Open its config or add exact images manually."
+                if expected and len(group) > expected else
+                f"This pool needs {expected or '?'} member images; the complete set is not available here."
+            )
+            self.image_action.setText("Complete pool required")
+        self.image_action.setEnabled(complete)
 
     def scan_images(self) -> None:
         if self.backend is None:
@@ -1333,17 +1829,24 @@ class ManagerWindow(QMainWindow):
 
     def _on_images(self, result: dict[str, Any]) -> None:
         self._images_scanned = True
-        self.images = result.get("images", [])
+        self.images = sorted(result.get("images", []), key=lambda image: (
+            str(image.get("poolId") or ""), int(image.get("memberIndex") or 0)
+        ))
         self.images_table.setRowCount(len(self.images))
+        self.images_table.setFixedHeight(min(390, max(120, 43 + len(self.images) * 39)))
         for row, image in enumerate(self.images):
             self._put(self.images_table, row, 0, str(image.get("path", "")), row)
             self._put(self.images_table, row, 1, human_size(image.get("bytes")))
-            self._put(self.images_table, row, 2, str(image.get("poolId", "")))
+            pool_id = str(image.get("poolId") or "")
+            self._put(self.images_table, row, 2, pool_id[:8] + "…" if len(pool_id) > 8 else pool_id)
+            self.images_table.item(row, 2).setToolTip(pool_id)
             self._put(self.images_table, row, 3,
                       f"{int(image.get('memberIndex', 0)) + 1} of {image.get('memberCount', '?')}")
             self._put(self.images_table, row, 4, "Yes" if image.get("encrypted") else "No")
             self.images_table.setRowHeight(row, 39)
         self.image_count.setText(f"{len(self.images)} member image(s) found")
+        self.images_table.clearSelection()
+        self._refresh_image_action()
         self._message(f"Image scan complete · {len(self.images)} found")
 
     def _password(self, title: str, confirm: bool = False) -> str | None:
@@ -1698,7 +2201,7 @@ class ManagerWindow(QMainWindow):
             return None
         return current
 
-    def mount_pool(self) -> None:
+    def mount_pool(self, startup: bool = False) -> None:
         config = self._current_config()
         if config is None or self.backend is None:
             return
@@ -1724,7 +2227,10 @@ class ManagerWindow(QMainWindow):
 
         def completed(result: dict[str, Any]) -> None:
             self._message(f"Mounted PoolFS on {config['drive']}")
-            QMessageBox.information(self, "Pool mounted", f"PoolFS is available at {config['drive']}")
+            if startup:
+                QApplication.quit()
+            else:
+                QMessageBox.information(self, "Pool mounted", f"PoolFS is available at {config['drive']}")
 
         self._run_operation("Mounting PoolFS…", work, completed)
 
@@ -1980,7 +2486,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="PoolFS Qt desktop manager")
     parser.add_argument("--bridge", type=Path, help="Native PoolFS bridge DLL")
     parser.add_argument("--screenshot", type=Path, help="Save a screenshot and exit")
-    parser.add_argument("--page", choices=("Pool", "Storage", "Images"), default="Storage")
+    parser.add_argument("--page", choices=("Pool", "Storage", "Images", "Stats"), default="Storage")
+    parser.add_argument("--startup-mount", type=Path,
+                        help="Mount a saved pool at sign-in, then close after success")
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
     app.setStyle("Fusion")
@@ -2014,6 +2522,30 @@ def main() -> int:
         QTimer.singleShot(180, capture)
     else:
         window.show()
+        if args.startup_mount is not None:
+            config_path = str(args.startup_mount.resolve())
+            deadline = time.monotonic() + 60
+
+            def start_when_ready() -> None:
+                if not Path(config_path).is_file():
+                    waiting = "Waiting for the pool config to become available…"
+                else:
+                    if window.config_path != config_path and not window.load_config_path(config_path):
+                        return
+                    missing = [member for member in window.members
+                               if not Path(str(member["path"])).is_file()]
+                    if not missing:
+                        window._refresh_members()
+                        window.mount_pool(startup=True)
+                        return
+                    waiting = f"Waiting for {len(missing)} member image(s) to become available…"
+                if time.monotonic() >= deadline:
+                    window._error("Automatic mount timed out waiting for the config or member images.")
+                    return
+                window._message(waiting)
+                QTimer.singleShot(2000, start_when_ready)
+
+            QTimer.singleShot(0, start_when_ready)
     return app.exec()
 
 

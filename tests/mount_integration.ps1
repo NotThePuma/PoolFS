@@ -223,6 +223,20 @@ try {
         }
         $spaceStream.Flush($true)
     } finally { $spaceStream.Dispose() }
+    $readBack = [IO.File]::ReadAllBytes($spaceProbe)
+    if ($readBack.Length -ne 8MB) { throw 'Statistics read probe was incomplete' }
+    $statsOutput = @(& $controller stats ($DriveLetter + ':') --json --interval-ms 100 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot read live statistics: $($statsOutput -join [Environment]::NewLine)"
+    }
+    $stats = ($statsOutput -join "`n" | ConvertFrom-Json)
+    if ($stats.writeBytes -lt 8MB -or $stats.readBytes -lt 8MB -or
+        $stats.writeOperations -lt 1 -or $stats.readOperations -lt 1 -or
+        $stats.capacityBytes -le 0 -or $stats.availableBytes -le 0 -or
+        $stats.availableBytes -gt $stats.capacityBytes) {
+        throw "Live statistics did not record file I/O and capacity: $($statsOutput -join ' ')"
+    }
+    Write-Host "Live statistics: $($stats.readBytes) bytes read, $($stats.writeBytes) bytes written."
     $spaceAfterWrite = [IO.DriveInfo]::new($DriveLetter).AvailableFreeSpace
     if ($spaceAfterWrite -ne $spaceBefore - 8MB) {
         throw "Mounted free space did not fall by 8 MiB: $spaceBefore -> $spaceAfterWrite"
