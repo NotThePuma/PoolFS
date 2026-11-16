@@ -5,12 +5,7 @@
 /manager/.venv/
 /manager/build/
 /manager/dist/
-/site/.site-build/
-/site/.package-stage-*/
-/site/.pages-stage-*/
-/site/.pages-upload-*/
-/site/dist/downloads/*
-!/site/dist/downloads/SHA256SUMS.txt
+/site/
 __pycache__/
 .pytest_cache/
 *.img
