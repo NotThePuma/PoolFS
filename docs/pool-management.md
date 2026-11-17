@@ -10,6 +10,7 @@ revision 3, with 1 to 16 members. Discovery reports whether a password is requir
 .\build\poolfsctl.exe discover 'T:\PoolFS\member.img' 'U:\MyMembers'
 .\build\poolfsctl.exe mount R: 'T:\PoolFS\member.img' 'U:\MyMembers'
 .\build\poolfsctl.exe status R:
+.\build\poolfsctl.exe health-config .\my-pool.json --json
 .\build\poolfsctl.exe stats R:
 .\build\poolfsctl.exe unmount R:
 ```

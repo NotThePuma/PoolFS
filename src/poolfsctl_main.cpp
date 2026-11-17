@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -126,11 +127,15 @@ std::optional<Header> parse_header(const Block& block, std::uint64_t file_bytes)
     return header;
 }
 
-std::optional<Header> inspect_member(const fs::path& path) {
+std::optional<Header> inspect_member(const fs::path& path, DWORD* open_error = nullptr) {
+    if (open_error) *open_error = ERROR_SUCCESS;
     UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (file.value == INVALID_HANDLE_VALUE) return std::nullopt;
+    if (file.value == INVALID_HANDLE_VALUE) {
+        if (open_error) *open_error = GetLastError();
+        return std::nullopt;
+    }
     LARGE_INTEGER length{};
     if (!GetFileSizeEx(file.value, &length) || length.QuadPart < 0) return std::nullopt;
     const auto bytes = static_cast<std::uint64_t>(length.QuadPart);
@@ -280,6 +285,154 @@ void print_discovery(const Discovery& found) {
         std::wcout << L" (" << found.seed.manifest[i].bytes / (1024 * 1024)
                    << L" MiB)\n";
     }
+}
+
+std::wstring json_quote(std::wstring_view value) {
+    std::wostringstream out;
+    out << L'"';
+    for (wchar_t c : value) {
+        if (c == L'"' || c == L'\\') out << L'\\' << c;
+        else if (c == L'\n') out << L"\\n";
+        else if (c == L'\r') out << L"\\r";
+        else if (c == L'\t') out << L"\\t";
+        else if (c < 32) out << L'?';
+        else out << c;
+    }
+    return out.str() + L'"';
+}
+
+bool active(wchar_t drive);
+
+int health_config(const fs::path& path, bool json) {
+    const auto config = poolfs::load_mount_config(path);
+    const DWORD occupied_mask = GetLogicalDrives();
+    const bool drive_occupied = occupied_mask &&
+        (occupied_mask & (DWORD{1} << (config.drive - L'A')));
+    const bool poolfs_drive = drive_occupied && active(config.drive);
+    const auto live = poolfs_drive ? poolfs::mount_stats::ReadMembers(config.drive)
+                                   : std::nullopt;
+    std::optional<Header> seed;
+    std::vector<std::wstring> reasons;
+    std::vector<std::optional<std::uint64_t>> host_free;
+    std::set<std::uint8_t> seen_indexes;
+    std::set<std::size_t> live_indexes;
+    std::size_t locked_count = 0;
+    for (const auto& member : config.members) {
+        std::wstring reason;
+        DWORD open_error = ERROR_SUCCESS;
+        const auto header = inspect_member(member, &open_error);
+        bool mounted_member = false;
+        if (live && open_error == ERROR_SHARING_VIOLATION) {
+            const auto identity = poolfs::mount_stats::IdentifyMember(member);
+            if (identity) {
+                const auto found = std::find(live->identities.begin(), live->identities.end(), *identity);
+                if (found != live->identities.end()) {
+                    mounted_member = true;
+                    if (!live_indexes.insert(found - live->identities.begin()).second)
+                        reason = L"duplicate member";
+                    else if (config.require_encrypted && !live->encrypted)
+                        reason = L"config requires encryption";
+                    else
+                        reason = L"mounted";
+                }
+            }
+        }
+        if (!seed && header) seed = header;
+        std::error_code path_error;
+        const bool present = fs::exists(member, path_error);
+        if (mounted_member) { /* The mount already checked this member. */ }
+        else if (open_error == ERROR_SHARING_VIOLATION) {
+            ++locked_count;
+            reason = L"locked; check after unmount";
+        }
+        else if (open_error == ERROR_ACCESS_DENIED) reason = L"access denied";
+        else if (path_error) reason = L"host path unavailable";
+        else if (!present) reason = L"missing";
+        else if (!header) reason = L"unreadable or invalid image";
+        else if (seed && header->pool_id != seed->pool_id) reason = L"different pool";
+        else if (seed && header->manifest != seed->manifest) reason = L"different member manifest";
+        else if (!seen_indexes.insert(header->index).second) reason = L"duplicate member";
+        else if (seed && header->encrypted != seed->encrypted) reason = L"encryption mismatch";
+        else if (config.require_encrypted && !header->encrypted) reason = L"config requires encryption";
+        std::optional<std::uint64_t> available;
+        ULARGE_INTEGER free{}, total{}, total_free{};
+        if (GetDiskFreeSpaceExW(member.root_path().c_str(), &free, &total, &total_free))
+            available = free.QuadPart;
+        reasons.push_back(reason);
+        host_free.push_back(available);
+    }
+    const bool mounted = live && live_indexes.size() == live->identities.size() &&
+        std::all_of(reasons.begin(), reasons.end(), [](const auto& reason) { return reason == L"mounted"; });
+    const bool wrong_count = (seed && seed->manifest.size() != config.members.size()) ||
+        (!live_indexes.empty() && live->identities.size() != config.members.size());
+    std::wstring summary_reason = L"ready";
+    if (wrong_count)
+        summary_reason = L"config member count differs from image manifest";
+    else {
+        for (const auto& reason : reasons) {
+            if (!reason.empty() && reason != L"mounted") { summary_reason = reason; break; }
+        }
+    }
+    if (mounted) summary_reason = L"mounted";
+    else if (poolfs_drive && !live && locked_count == config.members.size())
+        summary_reason = L"PoolFS drive is mounted; member headers are locked. Remount with the updated build to see live member status";
+    else if (summary_reason == L"ready" && drive_occupied)
+        summary_reason = L"drive letter in use";
+    const bool healthy = !drive_occupied && summary_reason == L"ready";
+    const auto drive_status = mounted ? L"mounted" : poolfs_drive ? L"PoolFS drive in use" :
+        drive_occupied ? L"drive letter in use" : L"available";
+    std::string verified;
+    fs::path marker_path = path;
+    marker_path += L".verified";
+    std::ifstream marker(marker_path);
+    if (marker) std::getline(marker, verified);
+    if (verified.size() > 32) verified.clear();
+    if (json) {
+        std::wostringstream out;
+        out << L"{\"name\":" << json_quote(config.name)
+                   << L",\"drive\":" << json_quote(std::wstring(1, config.drive) + L":")
+                   << L",\"mountable\":" << (healthy ? L"true" : L"false")
+                   << L",\"mounted\":" << (mounted ? L"true" : L"false")
+                   << L",\"driveStatus\":" << json_quote(drive_status)
+                   << L",\"reason\":" << json_quote(summary_reason)
+                   << L",\"lastVerifiedUtc\":";
+        if (verified.empty()) out << L"null";
+        else out << json_quote(std::wstring(verified.begin(), verified.end()));
+        out << L",\"members\":[";
+        for (std::size_t i = 0; i < config.members.size(); ++i) {
+            if (i) out << L',';
+            out << L"{\"path\":" << json_quote(config.members[i].wstring())
+                       << L",\"host\":" << json_quote(config.members[i].root_name().wstring())
+                       << L",\"hostFreeBytes\":";
+            if (host_free[i]) out << *host_free[i];
+            else out << L"null";
+            out << L",\"status\":" << json_quote(reasons[i].empty() ? L"ready" : reasons[i])
+                       << L'}';
+        }
+        out << L"]}";
+        const auto wide = out.str();
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide.data(),
+            static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+        if (bytes <= 0) throw std::runtime_error("cannot encode health report");
+        std::string utf8(bytes, '\0');
+        if (!WideCharToMultiByte(CP_UTF8, 0, wide.data(),
+                static_cast<int>(wide.size()), utf8.data(), bytes, nullptr, nullptr))
+            throw std::runtime_error("cannot encode health report");
+        std::cout << utf8 << '\n';
+    } else {
+        std::wcout << config.name << L" (" << config.drive << L":): "
+                   << (healthy ? L"members ready for mount attempt" : summary_reason) << L'\n';
+        std::wcout << L"Last successful verification: "
+                   << (verified.empty() ? L"not recorded" : std::wstring(verified.begin(), verified.end())) << L'\n';
+        for (std::size_t i = 0; i < config.members.size(); ++i) {
+            std::wcout << L"  " << i + 1 << L". " << config.members[i].wstring()
+                       << L" | " << (reasons[i].empty() ? L"ready" : reasons[i])
+                       << L" | host free ";
+            if (host_free[i]) std::wcout << *host_free[i] << L" bytes\n";
+            else std::wcout << L"unknown\n";
+        }
+    }
+    return healthy || mounted ? 0 : 2;
 }
 
 bool complete(const Discovery& found) {
@@ -552,12 +705,16 @@ void usage() {
                << L"       poolfsctl unmount <drive:>\n"
                << L"       poolfsctl reclaim <drive:>\n"
                << L"       poolfsctl stats <drive:> [--json] [--watch] [--interval-ms 1000]\n"
+               << L"       poolfsctl health-config <config.json> [--json]\n"
                << L"Positional discovery searches the seed folder and each drive's PoolFS folder.\n"
                << L"Config commands use only the member paths listed in JSON.\n"
                << L"Mount control is limited to this Windows logon session.\n";
 }
 
 int run(const std::vector<std::wstring>& args) {
+    if ((args.size() == 3 || args.size() == 4) && args[1] == L"health-config" &&
+        (args.size() == 3 || args[3] == L"--json"))
+        return health_config(args[2], args.size() == 4);
     const bool config_command = args.size() == 3 &&
         (args[1] == L"discover-config" || args[1] == L"mount-config");
     const bool config_alias = args.size() == 4 && args[1] == L"mount" &&

@@ -8,17 +8,17 @@ import os
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QPoint, QThread, Signal, QTimer, QRegularExpression
+from PySide6.QtCore import Qt, QPoint, QSettings, QThread, Signal, QTimer, QRegularExpression
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget, QAbstractItemView,
 )
@@ -32,6 +32,8 @@ MIN_IMAGE_MIB = 384
 MAX_IMAGE_MIB = ((1 << 63) - 1) // MIB
 MAX_SLIDER_STEPS = 1_000_000
 NEW_POOL_NAME = "PoolFS"
+RECENT_CONFIGS_KEY = "recentConfigPaths"
+RECENT_CONFIGS_LIMIT = 8
 STYLE = """
 QWidget { color: #edf3ff; font-family: "Segoe UI"; font-size: 12px; }
 QMainWindow, QWidget#root { background: #0b1220; }
@@ -59,6 +61,10 @@ QPushButton#nav { background: transparent; border: none; border-radius: 9px;
                   text-align: left; color: #9db0c9; padding: 12px 16px; font-size: 13px; }
 QPushButton#nav:hover { background: #1a2a3d; color: #edf3ff; }
 QPushButton#nav:checked { background: #1d3941; color: #77e5c1; }
+QMenu#recentConfigs { background: #17263a; border: 1px solid #39506c; padding: 5px; }
+QMenu#recentConfigs::item { padding: 7px 14px; }
+QMenu#recentConfigs::item:selected { background: #214c51; }
+QMenu#recentConfigs::item:disabled { color: #9db0c9; }
 QTableWidget { background: #121d2e; alternate-background-color: #17253a;
                border: none; gridline-color: #2a3950; selection-background-color: #214c51;
                selection-color: #ffffff; outline: none; }
@@ -275,9 +281,14 @@ class PasswordDialog(QDialog):
 
 
 class ManagerWindow(QMainWindow):
-    def __init__(self, backend: NativeBackend | None = None, auto_refresh: bool = True) -> None:
+    def __init__(self, backend: NativeBackend | None = None, auto_refresh: bool = True,
+                 settings: QSettings | None = None) -> None:
         super().__init__()
         self.backend = backend
+        self.settings = settings if settings is not None else QSettings(
+            QSettings.Format.NativeFormat, QSettings.Scope.UserScope, "PoolFS", "Manager", self
+        )
+        self.settings.setFallbacksEnabled(False)
         self.inventory: dict[str, Any] = {"disks": [], "volumes": []}
         self.host_volumes: list[dict[str, Any]] = []
         self.config: dict[str, Any] | None = None
@@ -288,6 +299,7 @@ class ManagerWindow(QMainWindow):
         self._images_scanned = False
         self._tasks: set[Task] = set()
         self._running_operation = False
+        self._health_check: tuple[str, object] | None = None
         self._mounted_drives: set[str] | None = None
         self._stats_previous: dict[str, tuple[float, int, int, int]] = {}
         self.setWindowTitle("PoolFS Manager")
@@ -343,7 +355,7 @@ class ManagerWindow(QMainWindow):
         side.addWidget(label("WORKSPACE", "micro"))
         self.nav: dict[str, QPushButton] = {}
         for name, glyph in (("Pool", "◉"), ("Storage", "▦"),
-                            ("Images", "▤"), ("Stats", "▥")):
+                            ("Images", "▤"), ("Stats", "▥"), ("Health", "✚")):
             item = QPushButton(f"{glyph}    {name}")
             item.setObjectName("nav")
             item.setCheckable(True)
@@ -379,6 +391,7 @@ class ManagerWindow(QMainWindow):
         self.pages.addWidget(self._build_storage_page())
         self.pages.addWidget(self._build_images_page())
         self.pages.addWidget(self._build_stats_page())
+        self.pages.addWidget(self._build_health_page())
         body.addWidget(main, 1)
 
         status_frame = QFrame()
@@ -455,6 +468,13 @@ class ManagerWindow(QMainWindow):
         top.addWidget(self.save_recovered_button)
         top.addWidget(button("New pool", self.new_pool))
         top.addWidget(button("Open config", self.open_config))
+        recent = QPushButton("Recent configs")
+        self.recent_configs_menu = QMenu(recent)
+        self.recent_configs_menu.setObjectName("recentConfigs")
+        self.recent_configs_menu.setToolTipsVisible(True)
+        self.recent_configs_menu.aboutToShow.connect(self._refresh_recent_configs)
+        recent.setMenu(self.recent_configs_menu)
+        top.addWidget(recent)
         current_box.addLayout(top)
         layout.addWidget(current)
 
@@ -789,8 +809,38 @@ class ManagerWindow(QMainWindow):
         self._clear_stats()
         return self._scroll_page(content)
 
+    def _build_health_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("page")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 10, 5)
+        layout.setSpacing(16)
+        overview, box = card()
+        box.addWidget(label("Pool health", "section"))
+        self.health_config_label = label("", "muted", True)
+        self.health_config_label.hide()
+        box.addWidget(self.health_config_label)
+        self.health_summary = label("Open a pool config to check its health.", "muted", True)
+        box.addWidget(self.health_summary)
+        self.health_refresh = button("Refresh health", self.refresh_health)
+        self.health_refresh.setEnabled(False)
+        box.addWidget(self.health_refresh)
+        self.health_checked = label("No health check run", "muted")
+        box.addWidget(self.health_checked)
+        layout.addWidget(overview)
+        members_card, members_box = card()
+        members_box.addWidget(label("Required members", "section"))
+        self.health_table = table(["Member image", "Host", "Host free", "Status"])
+        self.health_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        members_box.addWidget(self.health_table)
+        layout.addWidget(members_card)
+        self.health_verified = label("Last successful verification: not recorded", "muted")
+        layout.addWidget(self.health_verified)
+        layout.addStretch()
+        return self._scroll_page(content)
+
     def _set_page(self, name: str) -> None:
-        pages = {"Pool": 0, "Storage": 1, "Images": 2, "Stats": 3}
+        pages = {"Pool": 0, "Storage": 1, "Images": 2, "Stats": 3, "Health": 4}
         self.pages.setCurrentIndex(pages[name])
         page = self.pages.widget(pages[name])
         if isinstance(page, QScrollArea):
@@ -801,6 +851,7 @@ class ManagerWindow(QMainWindow):
             "Storage": "Choose host volumes for images, or inspect your disks.",
             "Images": "Find existing PoolFS member images on this machine.",
             "Stats": "Watch activity and space on a mounted pool.",
+            "Health": "Check the selected pool and its member images.",
         }
         self.page_subtitle.setText(subtitles[name])
         for title, control in self.nav.items():
@@ -809,6 +860,80 @@ class ManagerWindow(QMainWindow):
             self.scan_images()
         if name == "Stats":
             self._refresh_stats()
+        if name == "Health":
+            self.refresh_health()
+
+    def refresh_health(self) -> None:
+        path = self.config_path
+        backend = self.backend
+        if not path or backend is None:
+            self._health_check = None
+            self.health_refresh.setEnabled(False)
+            self.health_refresh.setText("Refresh health")
+            self.health_config_label.hide()
+            self.health_summary.setText("Open a pool config to check its health.")
+            self.health_table.setRowCount(0)
+            self.health_checked.setText("No health check run")
+            self.health_verified.setText("Last successful verification: not recorded")
+            return
+        if self._health_check and self._health_check[0] == path:
+            return
+        request = (path, object())
+        self._health_check = request
+        self.health_config_label.setText(f"Saved config: {path}")
+        self.health_config_label.show()
+        self.health_summary.setText("Checking pool members…")
+        self.health_checked.clear()
+        self.health_refresh.setText("Checking…")
+        self.health_refresh.setEnabled(False)
+        self.health_table.setRowCount(0)
+        self.health_verified.setText("Last successful verification: not recorded")
+
+        def inspect() -> dict[str, Any]:
+            try:
+                return backend.health_config(path)
+            except Exception as exc:
+                return {"error": str(exc)}
+
+        def completed(report: dict[str, Any]) -> None:
+            if self._health_check is not request:
+                return
+            self._health_check = None
+            if self.config_path != path:
+                self.refresh_health()
+                return
+            self.health_refresh.setText("Refresh health")
+            self.health_refresh.setEnabled(True)
+            self._show_health(report)
+
+        self._run(inspect, completed)
+
+    def _show_health(self, report: dict[str, Any]) -> None:
+        if "error" in report:
+            self.health_summary.setText(str(report["error"]))
+            self.health_table.setRowCount(0)
+            self.health_checked.setText(f"Check failed at {datetime.now():%H:%M:%S}")
+            return
+        members = report.get("members", [])
+        drive = report.get("drive", "")
+        if report.get("mounted"):
+            summary = f"Mounted on {drive} · all {len(members)} configured members in use"
+        elif report.get("mountable"):
+            summary = f"Unmounted · {len(members)} member headers checked · ready to mount on {drive}"
+        else:
+            summary = str(report.get("reason") or "Inspect member status below")
+        self.health_summary.setText(f"{report.get('name', 'PoolFS')}: {summary}")
+        self.health_table.setRowCount(len(members))
+        self.health_table.setFixedHeight(min(420, max(120, 43 + len(members) * 39)))
+        for row, member in enumerate(members):
+            self._put(self.health_table, row, 0, str(member.get("path", "")), row)
+            self._put(self.health_table, row, 1, str(member.get("host", "")))
+            self._put(self.health_table, row, 2, human_size(member.get("hostFreeBytes")))
+            self._put(self.health_table, row, 3, str(member.get("status", "unknown")))
+        self.health_verified.setText(
+            "Last successful verification: " + str(report.get("lastVerifiedUtc") or "not recorded")
+        )
+        self.health_checked.setText(f"Last checked at {datetime.now():%H:%M:%S}")
 
     def _message(self, text: str) -> None:
         self.status.setText(text)
@@ -1695,7 +1820,38 @@ class ManagerWindow(QMainWindow):
             return
         self.load_config_path(path)
 
-    def load_config_path(self, path: str) -> bool:
+    def _recent_config_paths(self) -> list[str]:
+        self.settings.sync()
+        return self.settings.value(RECENT_CONFIGS_KEY, [], type=list)
+
+    def _remember_config(self, path: str) -> None:
+        path = os.path.abspath(path)
+        key = os.path.normcase(path)
+        older = [item for item in self._recent_config_paths()
+                 if os.path.normcase(item) != key]
+        self.settings.setValue(RECENT_CONFIGS_KEY, [path, *older][:RECENT_CONFIGS_LIMIT])
+        self.settings.sync()
+
+    def _refresh_recent_configs(self) -> None:
+        menu = self.recent_configs_menu
+        menu.clear()
+        paths = self._recent_config_paths()
+        for path in paths:
+            title = menu.fontMetrics().elidedText(path, Qt.TextElideMode.ElideMiddle, 480)
+            action = menu.addAction(title.replace("&", "&&"))
+            action.setToolTip(path)
+            action.triggered.connect(lambda _checked=False, selected=path: self.load_config_path(selected))
+        if paths:
+            menu.addSeparator()
+            menu.addAction("Clear recent configs", self._clear_recent_configs)
+        else:
+            menu.addAction("No recent configs").setEnabled(False)
+
+    def _clear_recent_configs(self) -> None:
+        self.settings.remove(RECENT_CONFIGS_KEY)
+        self.settings.sync()
+
+    def load_config_path(self, path: str, *, remember: bool = True) -> bool:
         if self.backend is None:
             self._error("Native PoolFS bridge is unavailable.")
             return False
@@ -1712,6 +1868,8 @@ class ManagerWindow(QMainWindow):
             self.require_check.setChecked(bool(config.get("requireEncrypted", True)))
             self._refresh_members()
             self._set_page("Pool")
+            if remember:
+                self._remember_config(path)
             self._message(f"Opened {Path(path).name}")
             return True
         except Exception as exc:
@@ -2119,6 +2277,7 @@ class ManagerWindow(QMainWindow):
             self.members = [{"path": path, "planned": False}
                             for path in result["members"]]
             self._refresh_members()
+            self._remember_config(str(new_config))
             self._message(f"Expanded copies ready: {new_config.name}")
             QMessageBox.information(
                 self, "Expanded pool ready",
@@ -2180,6 +2339,7 @@ class ManagerWindow(QMainWindow):
         self.config = expected
         self.config_path = destination
         self._refresh_members()
+        self._remember_config(destination)
         self._message(f"Saved {Path(destination).name}")
         return True
 
@@ -2266,7 +2426,17 @@ class ManagerWindow(QMainWindow):
                 f"Incomplete journal tail: {'yes' if result.get('incompleteTail') else 'no'}"
             )
             QMessageBox.information(self, "Verification result", summary)
-            self._message("Pool verification completed.")
+            recorded = True
+            if result.get("issues") == 0 and not result.get("incompleteTail"):
+                try:
+                    Path(config_path + ".verified").write_text(
+                        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n",
+                        encoding="ascii",
+                    )
+                except OSError:
+                    recorded = False
+            self._message("Pool verification completed." if recorded else
+                          "Verification passed, but its timestamp could not be saved.")
 
         self._run_operation("Verifying PoolFS data…", work, completed)
 
@@ -2486,7 +2656,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="PoolFS Qt desktop manager")
     parser.add_argument("--bridge", type=Path, help="Native PoolFS bridge DLL")
     parser.add_argument("--screenshot", type=Path, help="Save a screenshot and exit")
-    parser.add_argument("--page", choices=("Pool", "Storage", "Images", "Stats"), default="Storage")
+    parser.add_argument("--page", choices=("Pool", "Storage", "Images", "Stats", "Health"), default="Storage")
     parser.add_argument("--startup-mount", type=Path,
                         help="Mount a saved pool at sign-in, then close after success")
     args = parser.parse_args()
@@ -2530,7 +2700,7 @@ def main() -> int:
                 if not Path(config_path).is_file():
                     waiting = "Waiting for the pool config to become available…"
                 else:
-                    if window.config_path != config_path and not window.load_config_path(config_path):
+                    if window.config_path != config_path and not window.load_config_path(config_path, remember=False):
                         return
                     missing = [member for member in window.members
                                if not Path(str(member["path"])).is_file()]

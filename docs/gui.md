@@ -69,6 +69,20 @@ same counters and space values are available with `poolfsctl stats V:`. Use
 `poolfsctl stats V: --watch` for continuous updates or add `--json` for one
 JSON object per sample. The mount must use a build that includes live stats.
 
+After opening a saved config, use **Health** to inspect every listed member,
+its host drive and available host space, and whether the complete set appears
+mountable. The same check is `poolfsctl health-config pool.json`; add `--json`
+for a structured report. A successful **Verify data** check records a timestamp
+in a `.verified` file beside the config. This timestamp is informational and
+does not prove that the member images are still intact or unchanged. Health
+checks public image headers and paths; it does not test an encryption password
+or scrub file data.
+
+While a pool is mounted, Health can match the config against the member files
+opened by the mount and show their status as **mounted**. If an older mount
+keeps those images locked, Health explains that their headers cannot be read.
+Remount with the current build to see live member status.
+
 If image creation fails partway through, the manager reports the files already
 created and leaves them in place. Inspect those paths before starting again.
 
@@ -100,7 +114,11 @@ draft without deleting any image files or saved config.
 
 ## Open and mount an existing pool
 
-Choose **Open config** on **Pool**. The member list shows present and missing
+Choose **Open config** on **Pool**. Use **Recent configs** to reopen one of the
+last eight configs you opened or saved. The list is saved for your current
+Windows account and can be cleared from the menu.
+
+The member list shows present and missing
 paths. **Mount** checks the saved config against the displayed member list and
 prompts for the password if the pool is encrypted. **Unmount** stops the
 selected drive's PoolFS mount. **Verify data** opens the complete member set

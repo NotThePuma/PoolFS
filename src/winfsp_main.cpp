@@ -805,6 +805,7 @@ int main() {
     try {
         if (named_image_v6) poolfs::validate_pool_name(named_label);
         std::unique_ptr<MountState> state;
+        bool encrypted = false;
         if (raw_v3)
             state = std::make_unique<MountState>(poolfs::Pool::RawV3Tag{}, raw_v3_members);
         else if (image_v3)
@@ -814,7 +815,7 @@ int main() {
         else if (image_v5)
             state = std::make_unique<MountState>(poolfs::Pool::V5ImageTag{}, image_members);
         else if (image_v6 || named_image_v6 || image_default || image_config) {
-            const bool encrypted = poolfs::Pool::V6Encrypted(image_members.front());
+            encrypted = poolfs::Pool::V6Encrypted(image_members.front());
             if (image_config && config->require_encrypted && !encrypted)
                 throw std::runtime_error("mount config requires an encrypted pool");
             if (encrypted) {
@@ -896,6 +897,8 @@ int main() {
             throw std::runtime_error("could not create shutdown event security");
         }
         SECURITY_ATTRIBUTES event_attributes{sizeof(SECURITY_ATTRIBUTES), event_security, FALSE};
+        if (state->is_v6)
+            state->stats.PublishMembers(drive, &event_attributes, image_members, encrypted);
         stop_event = CreateEventW(&event_attributes, TRUE, FALSE, event_name.c_str());
         const DWORD event_error = GetLastError();
         if (!stop_event) {

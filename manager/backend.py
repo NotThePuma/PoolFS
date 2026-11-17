@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -150,6 +151,26 @@ class NativeBackend:
 
     def discover_config(self, path: str) -> dict[str, Any]:
         return self._call("discover_config", path)
+
+    def health_config(self, path: str) -> dict[str, Any]:
+        controller = self.path.parent / "poolfsctl.exe"
+        try:
+            result = subprocess.run(
+                [str(controller), "health-config", path, "--json"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False, timeout=15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise BridgeError("Health check timed out. Check that the host drives respond and try again.") from exc
+        except FileNotFoundError as exc:
+            raise BridgeError("Health needs poolfsctl.exe beside the PoolFS native library.") from exc
+        if result.returncode not in (0, 2):
+            raise BridgeError(result.stderr.strip() or "Could not inspect pool health.")
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise BridgeError("Pool health returned invalid data.") from exc
 
     def config_is_encrypted(self, path: str) -> dict[str, Any]:
         return self._call("config_is_encrypted", path)

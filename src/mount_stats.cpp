@@ -9,6 +9,14 @@ namespace {
 
 constexpr DWORD kMagic = 0x53534650; // PFSS
 constexpr DWORD kVersion = 1;
+constexpr DWORD kMembersMagic = 0x4d534650; // PFSM
+
+struct SharedMembers {
+    DWORD magic;
+    DWORD count;
+    DWORD encrypted;
+    std::array<MemberIdentity, 16> identities;
+};
 
 struct alignas(8) Shared {
     DWORD magic;
@@ -30,8 +38,91 @@ std::wstring mapping_name(wchar_t drive) {
 } // namespace
 
 Publisher::~Publisher() {
+    if (members_mapping_) CloseHandle(members_mapping_);
     if (view_) UnmapViewOfFile(view_);
     if (mapping_) CloseHandle(mapping_);
+}
+
+std::optional<MemberIdentity> IdentifyMember(const std::filesystem::path& path) {
+    // Attribute access works even while the core holds its exclusive data handle.
+    const HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return std::nullopt;
+    FILE_ID_INFO id{};
+    if (GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id))) {
+        CloseHandle(file);
+        MemberIdentity identity{};
+        identity.volume = id.VolumeSerialNumber;
+        std::memcpy(identity.index.data(), id.FileId.Identifier, identity.index.size());
+        if (identity.index == MemberIdentity{}.index) return std::nullopt;
+        return identity;
+    }
+    BY_HANDLE_FILE_INFORMATION info{};
+    const BOOL ok = GetFileInformationByHandle(file, &info);
+    CloseHandle(file);
+    const auto index = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) |
+        info.nFileIndexLow;
+    if (!ok || !index || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return std::nullopt;
+    MemberIdentity identity{};
+    identity.volume = info.dwVolumeSerialNumber;
+    std::memcpy(identity.index.data(), &index, sizeof(index));
+    return identity;
+}
+
+void Publisher::PublishMembers(wchar_t drive, SECURITY_ATTRIBUTES* security,
+        const std::vector<std::filesystem::path>& paths, bool encrypted) noexcept {
+    if (members_mapping_ || paths.empty() || paths.size() > 16) return;
+    try {
+        SharedMembers report{};
+        report.count = static_cast<DWORD>(paths.size());
+        report.encrypted = encrypted;
+        for (std::size_t i = 0; i < paths.size(); ++i) {
+            const auto identity = IdentifyMember(paths[i]);
+            if (!identity) return;
+            report.identities[i] = *identity;
+        }
+        const auto name = mapping_name(drive) + L".Members";
+        const HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, security,
+            PAGE_READWRITE, 0, sizeof(report), name.c_str());
+        if (!mapping) return;
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(mapping);
+            return;
+        }
+        members_mapping_ = mapping;
+        auto* view = static_cast<SharedMembers*>(
+            MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, sizeof(report)));
+        if (!view) return;
+        *view = report;
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&view->magic), kMembersMagic);
+        UnmapViewOfFile(view);
+    } catch (...) {
+        // Health is optional. A failure here must not prevent mounting.
+    }
+}
+
+std::optional<MountedMembers> ReadMembers(wchar_t drive) {
+    const auto name = mapping_name(drive) + L".Members";
+    const HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
+    if (!mapping) return std::nullopt;
+    const auto* view = static_cast<const SharedMembers*>(
+        MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(SharedMembers)));
+    SharedMembers report{};
+    if (view) {
+        if (view->magic == kMembersMagic) {
+            MemoryBarrier();
+            report = *view;
+        }
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(mapping);
+    if (report.magic != kMembersMagic || !report.count ||
+        report.count > report.identities.size()) return std::nullopt;
+    return MountedMembers{
+        {report.identities.begin(), report.identities.begin() + report.count},
+        report.encrypted != 0};
 }
 
 bool Publisher::Start(wchar_t drive, SECURITY_ATTRIBUTES* security) noexcept {

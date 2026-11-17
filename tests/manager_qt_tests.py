@@ -12,7 +12,8 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manager"))
 
-from PySide6.QtCore import Qt, QTimer  # noqa: E402
+from PySide6.QtCore import Qt, QSettings, QTemporaryDir, QTimer  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTableWidgetItem  # noqa: E402
 from app import MIB, ManagerWindow, validate_pool_name  # noqa: E402
 
@@ -181,9 +182,14 @@ def check_discovered_pool_flow(window: ManagerWindow) -> None:
 
 def main() -> None:
     application = QApplication([])
-    window = ManagerWindow(None, auto_refresh=False)
+    temporary = QTemporaryDir()
+    assert temporary.isValid()
+    settings_path = str(Path(temporary.path()) / "manager.ini")
+    settings = QSettings(settings_path, QSettings.Format.IniFormat)
+    window = ManagerWindow(None, auto_refresh=False, settings=settings)
     window._drive_available = lambda _drive: True  # type: ignore[method-assign]
     assert window.pool_name.text() == "PoolFS"
+    assert not window.health_refresh.isEnabled()
     assert not window.encrypt_check.isChecked()
     assert not window.require_check.isChecked()
     assert window.create_button.text() == "Create pool"
@@ -209,13 +215,23 @@ def main() -> None:
     class FakeBackend:
         mounted_drives: list[str] = []
         stats_calls = 0
+        health_calls = 0
 
         def save_config(self, *arguments: object) -> dict[str, str]:
             saved.append(arguments)
             return {"path": str(arguments[0])}
 
+        def load_config(self, path: str) -> dict[str, object]:
+            return {"name": "Travel Pool", "drive": "P:", "requireEncrypted": False,
+                    "members": [str(Path(path).with_suffix(".img"))]}
+
         def mounts(self) -> dict[str, list[str]]:
             return {"mountedDrives": self.mounted_drives}
+
+        def health_config(self, path: str) -> dict[str, object]:
+            self.health_calls += 1
+            return {"name": "Travel Pool", "drive": "V:", "mounted": True,
+                    "mountable": False, "members": [{"path": path, "status": "mounted"}]}
 
         def stats(self, drive: str) -> dict[str, int | str]:
             self.stats_calls += 1
@@ -243,6 +259,17 @@ def main() -> None:
         window.save_button, window.mount_button, window.verify_button,
         window.grow_button, window.reclaim_button, window.unmount_button,
     ))
+    other = str(Path(temporary.path()) / "another" / Path(destination).name)
+    assert window.load_config_path(other)
+    reopened = ManagerWindow(fake_backend, auto_refresh=False,
+                             settings=QSettings(settings_path, QSettings.Format.IniFormat))
+    assert reopened._recent_config_paths() == [other, destination]
+    reopened._refresh_recent_configs()
+    reopened.recent_configs_menu.actions()[1].trigger()
+    assert reopened.config_path == destination
+    assert window._recent_config_paths() == [destination, other]
+    reopened._clear_recent_configs()
+    assert window._recent_config_paths() == []
 
     image = str(Path(__file__))  # Existing file is sufficient for button state.
     window.config_path = image  # The button state checks that the saved file still exists.
@@ -294,6 +321,28 @@ def main() -> None:
     assert window.stats_write_rate.text() == "2.0 MiB/s"
     assert window.stats_total_read.text() == "2 MiB"
     assert window.stats_usage.value() == 40
+    window._show_health({"name": "Travel Pool", "mountable": False,
+                         "driveStatus": "available", "lastVerifiedUtc": None,
+                         "members": [{"path": image, "host": "C:",
+                                      "hostFreeBytes": 8 * MIB, "status": "missing"}]})
+    assert "Inspect member status below" in window.health_summary.text()
+    assert window.health_table.rowCount() == 1
+    assert window.health_table.item(0, 3).text() == "missing"
+    window.config_path = image
+    window._set_page("Health")
+    for expected_calls in (1, 2):
+        assert not window.health_refresh.isEnabled()
+        assert window.health_refresh.text() == "Checking…"
+        deadline = time.monotonic() + 3
+        while not window.health_refresh.isEnabled() and time.monotonic() < deadline:
+            QTest.qWait(10)
+        assert window.health_refresh.isEnabled()
+        assert fake_backend.health_calls == expected_calls
+        assert "Mounted on V:" in window.health_summary.text()
+        assert window.health_table.item(0, 3).text() == "mounted"
+        assert window.health_checked.text().startswith("Last checked at ")
+        if expected_calls == 1:
+            window.health_refresh.click()
     fake_backend.mounted_drives = []
     window._set_page("Pool")
     events: list[bool] = []
