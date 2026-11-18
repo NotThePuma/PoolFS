@@ -100,6 +100,10 @@ class NativeBackend:
         self._bind("unmount", [ctypes.c_wchar])
         self._bind("reclaim", [ctypes.c_wchar])
         self._bind("mounts", [])
+        if hasattr(self.dll, "poolfs_bridge_match_mount"):
+            self._bind("match_mount", [
+                ctypes.c_wchar, ctypes.POINTER(ctypes.c_wchar_p), ctypes.c_uint32, ctypes.c_int,
+            ])
         self._bind("stats", [ctypes.c_wchar])
         self._bind("partition", [
             ctypes.POINTER(PartitionRequest), ctypes.c_int,
@@ -237,6 +241,14 @@ class NativeBackend:
 
     def mounts(self) -> dict[str, Any]:
         return self._call("mounts")
+
+    def match_mount(self, drive: str, config: dict[str, Any]) -> bool | None:
+        if not hasattr(self.dll, "poolfs_bridge_match_mount"):
+            return None
+        members = config["members"]
+        paths = (ctypes.c_wchar_p * len(members))(*members)
+        return self._call("match_mount", drive[0], paths, len(members),
+                          int(config["requireEncrypted"]))["matches"]
 
     def stats(self, drive: str) -> dict[str, Any]:
         return self._call("stats", drive[0])

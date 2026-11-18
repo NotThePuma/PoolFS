@@ -559,6 +559,27 @@ extern "C" int __cdecl poolfs_bridge_mounts(char** response) noexcept {
     });
 }
 
+extern "C" int __cdecl poolfs_bridge_match_mount(
+        wchar_t drive, const wchar_t* const* members, std::uint32_t count,
+        int require_encrypted, char** response) noexcept {
+    return invoke(response, [&]() -> std::string {
+        const auto paths = path_array(members, count);
+        const auto live = poolfs::mount_stats::ReadMembers(drive_letter(drive));
+        if (!live) return "{\"matches\":null}";
+        auto unmatched = live->identities;
+        if (unmatched.size() != paths.size() || (require_encrypted && !live->encrypted))
+            return "{\"matches\":false}";
+        for (const auto& path : paths) {
+            const auto identity = poolfs::mount_stats::IdentifyMember(path);
+            if (!identity) return "{\"matches\":null}";
+            const auto found = std::find(unmatched.begin(), unmatched.end(), *identity);
+            if (found == unmatched.end()) return "{\"matches\":false}";
+            unmatched.erase(found);
+        }
+        return "{\"matches\":true}";
+    });
+}
+
 extern "C" int __cdecl poolfs_bridge_stats(
         wchar_t drive, char** response) noexcept {
     return invoke(response, [&] {

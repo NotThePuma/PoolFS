@@ -112,7 +112,7 @@ unused drive letter if `R:` is occupied. Direct `poolfs-mount.exe` remains
 available for a foreground mount. See [pool management](docs/pool-management.md)
 for discovery across volumes and controller status.
 
-Open **Stats** in the manager to see live read and write speeds, totals,
+Open **Activity** in the manager to see live read and write speeds, totals,
 operation counts, and available pool space. The same measurements are available
 from the command line with `.\build\poolfsctl.exe stats R:`; add `--watch` for
 continuous updates or `--json` for machine-readable output. These speeds count
@@ -196,7 +196,7 @@ The Python/Qt Windows manager shows host disks, partitions, volumes, PoolFS
 member images, and configs. Run `.\build\poolfs-manager.exe` beside the other
 built tools. It can create v6 image pools with individual member sizes, save a
 portable JSON config, mount and unmount, and verify an unmounted pool. Select
-one or more formatted host volumes on **Storage**, then **Continue with N
+one or more formatted host volumes on **Disks & volumes**, then **Continue with N
 volumes** to queue new member images on those partitions. Its built-in
 partition controls require Administrator rights. See the [GUI guide](docs/gui.md).
 

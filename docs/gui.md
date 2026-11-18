@@ -21,16 +21,16 @@ manager runs from Python source. Keep that native build together.
 
 ## Create a pool
 
-1. On **Pool**, choose **Choose host volumes** to open **Storage**. Tick **Use**
+1. On **Overview**, choose **Choose host volumes** to open **Disks & volumes**. Tick **Use**
    for one or more formatted entries in **Host volumes**. The **Disk / part**
    column shows which physical partition holds
    each volume. Click a disk below to inspect its partitions; that selection
    is optional when creating a pool. Click **Continue with N volumes**.
    The manager queues a new `PoolFS\member-N.img` path on each selected
-   volume and switches to **Pool**. Member numbers are unique across the new
+   volume and switches to **Overview**. Member numbers are unique across the new
    pool, starting at 1 and increasing in selection order; an occupied name
    is skipped. It does not create the images yet.
-2. On **Pool**, keep the default **PoolFS** name or enter your own, then choose
+2. In **Pool settings**, keep the default **PoolFS** name or enter your own, then choose
    an unused mount drive. Each queued
    image starts at 384 MiB. Select a new image in the member list, then drag
    the size slider or enter an exact size in MiB. The maximum uses current
@@ -60,7 +60,7 @@ does not shrink the member image files or securely erase old blocks. You can als
 `poolfsctl reclaim V:` for a mounted `V:` pool in the same Windows logon session.
 Flush, unmount, and remount do not force checkpoint rotation.
 
-Open **Stats** to choose a mounted drive and see its current read and write
+Open **Activity** to choose a mounted drive and see its current read and write
 speeds, a recent-speed graph, cumulative bytes and operations, and used and
 available pool space. The view updates each second. Read and write speeds
 measure completed file activity served by PoolFS; they exclude physical disk
@@ -114,14 +114,27 @@ draft without deleting any image files or saved config.
 
 ## Open and mount an existing pool
 
-Choose **Open config** on **Pool**. Use **Recent configs** to reopen one of the
+Choose **Open configs…** in the sidebar. Use **Recent configs** to reopen one of the
 last eight configs you opened or saved. The list is saved for your current
 Windows account and can be cleared from the menu.
+
+Select several JSON files in **Open configs…** to add them to **Open pools**.
+Select a pool in the list to switch to it, or choose **+ New** to start a draft.
+Mounted entries show a usage bar, percent used, and free space out of total capacity.
+Each mounted pool needs a different drive letter. **Close selected**
+leaves its drive mounted. Reopen its config to manage it again.
+
+You can open several configs from PowerShell:
+
+```powershell
+.\poolfs-manager.exe '.\Work pool.json' '.\Archive pool.json'
+```
 
 The member list shows present and missing
 paths. **Mount** checks the saved config against the displayed member list and
 prompts for the password if the pool is encrypted. **Unmount** stops the
-selected drive's PoolFS mount. **Verify data** opens the complete member set
+selected drive's PoolFS mount. **Overview** shows the mount status next to
+the pool's main controls. In **Maintenance**, **Verify data** opens the complete member set
 read-only and scrubs live file data while unmounted. Verification does not
 repair damage. A wrong or incomplete member list cannot mount. Use
 **Save config…** to save a new JSON config after moving images or changing the
@@ -138,7 +151,7 @@ the current Windows account and machine, not the portable JSON config. Keep
 the manager executable and its companion binaries in the same location after
 enabling it.
 
-On **Images**, choose **Scan again** to scan the `PoolFS` folders on mounted
+In **Find images**, choose **Scan again** to scan the `PoolFS` folders on mounted
 host volumes. The scan is bounded and does not follow directory links. Select
 any member image. When every member of that pool is present, choose **Load
 complete pool**; the manager loads all of its members in order. Name the pool
@@ -148,7 +161,7 @@ the action stays disabled until the complete set is available.
 
 ## Host disks and partitions
 
-**Storage** lists physical disks and their partitions, including partitions
+**Disks & volumes** lists physical disks and their partitions, including partitions
 without drive letters when Windows exposes them. Clicking a disk filters the
 partition list, which shows each partition's drive letter, file system, size,
 and label when known. **Host volumes** lists physical volumes with drive

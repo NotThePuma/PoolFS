@@ -71,6 +71,9 @@ __declspec(dllexport) int __cdecl poolfs_bridge_unmount(
 __declspec(dllexport) int __cdecl poolfs_bridge_reclaim(
     wchar_t drive, char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_mounts(char** response) noexcept;
+__declspec(dllexport) int __cdecl poolfs_bridge_match_mount(
+    wchar_t drive, const wchar_t* const* members, std::uint32_t count,
+    int require_encrypted, char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_stats(
     wchar_t drive, char** response) noexcept;
 __declspec(dllexport) int __cdecl poolfs_bridge_partition(

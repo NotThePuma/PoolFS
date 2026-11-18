@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manager"))
 from PySide6.QtCore import Qt, QSettings, QTemporaryDir, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTableWidgetItem  # noqa: E402
-from app import MIB, ManagerWindow, validate_pool_name  # noqa: E402
+from app import MIB, POOL_USAGE_ROLE, ManagerWindow, PoolWorkspace, validate_pool_name  # noqa: E402
 
 
 def check_member_names(window: ManagerWindow) -> None:
@@ -228,6 +228,9 @@ def main() -> None:
         def mounts(self) -> dict[str, list[str]]:
             return {"mountedDrives": self.mounted_drives}
 
+        def match_mount(self, drive: str, config: dict[str, object]) -> bool:
+            return drive in self.mounted_drives and config["name"] == "Travel Pool"
+
         def health_config(self, path: str) -> dict[str, object]:
             self.health_calls += 1
             return {"name": "Travel Pool", "drive": "V:", "mounted": True,
@@ -300,7 +303,7 @@ def main() -> None:
     ))
     assert window.reclaim_button.isEnabled()
     assert window.unmount_button.isEnabled()
-    assert "P: already has a PoolFS mount" in window.pool_guidance.text()
+    assert window.mount_indicator.text() == "P: · PoolFS mounted"
     window.pool_name.setText("Changed Pool")
     assert not window.reclaim_button.isEnabled()
     assert window.unmount_button.isEnabled()
@@ -309,10 +312,48 @@ def main() -> None:
     window._refresh_mount_state()
     assert window.mount_button.isEnabled()
     assert not window.unmount_button.isEnabled()
+    assert window.mount_indicator.text() == "P: · Unmounted"
+    workspace = PoolWorkspace(fake_backend, auto_refresh=False, settings=settings)
+    assert workspace.open_pool_config(destination)
+    first = workspace.pool_stack.currentWidget()
+    assert workspace.open_pool_config(other)
+    second = workspace.pool_stack.currentWidget()
+    assert first is not second and workspace.pool_list.count() == 2
+    assert first.config_path == destination and second.config_path == other
+    assert workspace.open_pool_config(destination)
+    assert workspace.pool_stack.currentWidget() is first and workspace.pool_list.count() == 2
+    second.config["name"] = "Another pool"
+    second.pool_name.setText("Another pool")
+    fake_backend.mounted_drives = ["P:"]
+    workspace.refresh_mounts()
+    assert first.unmount_button.isEnabled()
+    assert first.mount_button.isHidden()
+    assert not second.unmount_button.isEnabled()
+    assert second.mount_indicator.text() == "P: · Different pool mounted"
+    assert "Mounted" in workspace.pool_list.item(0).text()
+    mounted_entry = workspace.pool_list.item(0)
+    assert mounted_entry.data(POOL_USAGE_ROLE) == (6 * MIB, 10 * MIB)
+    assert "40% used" in mounted_entry.toolTip()
+    assert "6 MiB / 10 MiB free" in mounted_entry.toolTip()
+    assert workspace.pool_list.item(1).data(POOL_USAGE_ROLE) == "Usage unavailable"
+    fake_backend.mounted_drives = []
+    member = Path(temporary.path()) / "present.img"
+    member.touch()
+    first.members[0]["path"] = str(member)
+    with patch.object(first, "_drive_available", return_value=True):
+        workspace.refresh_mounts()
+    assert mounted_entry.data(POOL_USAGE_ROLE) == "Mount to see usage"
+    workspace.pool_list.setCurrentRow(1)
+    assert workspace.pool_stack.currentWidget() is second
+    workspace.close_pool_button.click()
+    assert workspace.pool_list.count() == 1 and first.config_path == destination
+    workspace.close()
+    fake_backend.mounted_drives = []
 
     check_discovered_pool_flow(window)
     check_image_size_controls(window)
     fake_backend.mounted_drives = ["P:"]
+    fake_backend.stats_calls = 0
     with patch("app.time.monotonic", side_effect=[100.0, 101.0]):
         window._set_page("Stats")
         window._poll_stats()
