@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -65,6 +67,11 @@ struct UniqueHandle {
     UniqueHandle(const UniqueHandle&) = delete;
     UniqueHandle& operator=(const UniqueHandle&) = delete;
 };
+
+[[noreturn]] void windows_error(const char* action) {
+    throw std::system_error(static_cast<int>(GetLastError()),
+                            std::system_category(), action);
+}
 
 std::uint32_t number32(const Block& block, std::size_t offset) {
     std::uint32_t value = 0;
@@ -458,6 +465,134 @@ bool active(wchar_t drive) {
     return event.value != nullptr;
 }
 
+void require_regular_move_file(HANDLE file) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileType(file) != FILE_TYPE_DISK || !GetFileInformationByHandle(file, &info))
+        throw std::runtime_error("move requires ordinary member image files");
+    if (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+        throw std::runtime_error("move requires member images without file links");
+}
+
+bool mark_for_deletion(HANDLE file) {
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    return SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
+                                     sizeof(disposition)) != FALSE;
+}
+
+void copy_image(HANDLE source, HANDLE destination) {
+    std::vector<std::byte> buffer(4 * 1024 * 1024);
+    for (;;) {
+        DWORD read = 0;
+        if (!ReadFile(source, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr))
+            windows_error("cannot read source member image");
+        if (!read) break;
+        DWORD written = 0;
+        if (!WriteFile(destination, buffer.data(), read, &written, nullptr))
+            windows_error("cannot write destination member image");
+        if (written != read)
+            throw std::runtime_error("destination member image received a short write");
+    }
+    if (!FlushFileBuffers(destination))
+        windows_error("cannot flush destination member image");
+}
+
+void publish_image(HANDLE file, const fs::path& destination) {
+    const auto name = destination.wstring();
+    const auto name_bytes = name.size() * sizeof(wchar_t);
+    std::vector<std::byte> buffer(sizeof(FILE_RENAME_INFO) + name_bytes);
+    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+    info->ReplaceIfExists = FALSE;
+    info->RootDirectory = nullptr;
+    info->FileNameLength = static_cast<DWORD>(name_bytes);
+    std::memcpy(info->FileName, name.c_str(), name_bytes + sizeof(wchar_t));
+    if (!SetFileInformationByHandle(file, FileRenameInfo, info,
+                                   static_cast<DWORD>(buffer.size())))
+        windows_error("cannot publish destination member image");
+}
+
+void require_host_destination(const fs::path& destination) {
+    const auto name = destination.filename().wstring();
+    if (name.empty() || name.find_first_of(L":*?\"<>|") != std::wstring::npos ||
+        name.back() == L'.' || name.back() == L' ')
+        throw std::invalid_argument("destination must name a new image file");
+    if (!fs::is_directory(destination.parent_path()))
+        throw std::runtime_error("destination folder must already exist");
+    if (GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES)
+        throw std::runtime_error("destination already exists; choose a new filename");
+    const auto host = fs::canonical(destination.parent_path());
+    std::array<wchar_t, 32768> root{};
+    std::array<wchar_t, 64> filesystem{};
+    if (GetVolumePathNameW(host.c_str(), root.data(), static_cast<DWORD>(root.size())) &&
+        (active(root[0]) || (GetVolumeInformationW(root.data(), nullptr, 0, nullptr, nullptr,
+            nullptr, filesystem.data(), static_cast<DWORD>(filesystem.size())) &&
+            CompareStringOrdinal(filesystem.data(), -1, L"PoolFS", -1, TRUE) == CSTR_EQUAL)))
+        throw std::runtime_error("choose a host filesystem outside mounted PoolFS drives");
+}
+
+int move_member(const fs::path& config_path, const fs::path& source_path,
+                const fs::path& destination_path) {
+    const auto config = poolfs::load_mount_config(config_path);
+    const auto member = std::find_if(config.members.begin(), config.members.end(),
+        [&](const fs::path& path) { return poolfs::mount_paths_alias(path, source_path); });
+    if (member == config.members.end())
+        throw std::invalid_argument("source image is not listed in the mount config");
+    auto destination = fs::absolute(destination_path).lexically_normal();
+    destination.make_preferred();
+    require_host_destination(destination);
+
+    // Hold all members against mounting or another relocation until config commit.
+    std::array<UniqueHandle, 16> files;
+    const auto index = static_cast<std::size_t>(member - config.members.begin());
+    for (std::size_t i = 0; i < config.members.size(); ++i) {
+        const DWORD access = GENERIC_READ | (i == index ? DELETE : 0);
+        files[i].value = CreateFileW(config.members[i].c_str(), access, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+        if (files[i].value == INVALID_HANDLE_VALUE)
+            windows_error("cannot lock pool members for move; unmount the pool and check member access");
+        require_regular_move_file(files[i].value);
+    }
+    (void)discover_exact(config);
+    const auto source = files[index].value;
+    auto updated = config;
+    updated.members[index] = destination;
+
+    // Publish a fully written image before changing the config. The source is
+    // left in place until the updated config has been atomically saved.
+    UniqueHandle staging;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        const auto temporary = destination.parent_path() /
+            (L".poolfs-moving-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+             std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt));
+        staging.value = CreateFileW(temporary.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ,
+            nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (staging.value != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS)
+            windows_error("cannot create staging image in destination folder");
+    }
+    if (staging.value == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("cannot reserve a staging image name");
+    try {
+        copy_image(source, staging.value);
+        publish_image(staging.value, destination);
+        if (!FlushFileBuffers(staging.value))
+            windows_error("cannot flush published member image");
+        (void)discover_exact(updated);
+        if (poolfs::load_mount_config(config_path) != config)
+            throw std::runtime_error("mount config changed during the move; reload it and try again");
+        poolfs::save_mount_config(updated, config_path);
+    } catch (...) {
+        if (!mark_for_deletion(staging.value))
+            std::cerr << "PoolFS could not clean up the destination copy; check the destination folder.\n";
+        throw;
+    }
+    if (!mark_for_deletion(source))
+        std::cerr << "Config saved, but Windows could not remove the original image. "
+                     "The old path now holds an extra copy.\n";
+    std::cout << "Moved member image and saved mount config.\n";
+    return 0;
+}
+
 std::wstring quote(std::wstring_view input) {
     std::wstring output = L"\"";
     std::size_t slashes = 0;
@@ -706,12 +841,15 @@ void usage() {
                << L"       poolfsctl reclaim <drive:>\n"
                << L"       poolfsctl stats <drive:> [--json] [--watch] [--interval-ms 1000]\n"
                << L"       poolfsctl health-config <config.json> [--json]\n"
+               << L"       poolfsctl move-member <config.json> <source.img> <destination.img>\n"
                << L"Positional discovery searches the seed folder and each drive's PoolFS folder.\n"
                << L"Config commands use only the member paths listed in JSON.\n"
                << L"Mount control is limited to this Windows logon session.\n";
 }
 
 int run(const std::vector<std::wstring>& args) {
+    if (args.size() == 5 && args[1] == L"move-member")
+        return move_member(args[2], args[3], args[4]);
     if ((args.size() == 3 || args.size() == 4) && args[1] == L"health-config" &&
         (args.size() == 3 || args[3] == L"--json"))
         return health_config(args[2], args.size() == 4);

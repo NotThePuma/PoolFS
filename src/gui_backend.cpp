@@ -142,77 +142,6 @@ std::wstring wide_text(std::string_view input) {
     return output;
 }
 
-void append_json_string(std::string& output, std::wstring_view value) {
-    std::wstring escaped;
-    escaped.reserve(value.size() + 2);
-    escaped.push_back(L'"');
-    constexpr wchar_t hex[] = L"0123456789abcdef";
-    for (const auto c : value) {
-        if (c == L'"' || c == L'\\') {
-            escaped.push_back(L'\\');
-            escaped.push_back(c);
-        } else if (c < 0x20) {
-            escaped += L"\\u00";
-            escaped.push_back(hex[(c >> 4) & 15]);
-            escaped.push_back(hex[c & 15]);
-        } else {
-            escaped.push_back(c);
-        }
-    }
-    escaped.push_back(L'"');
-    output += utf8(escaped);
-}
-
-std::string config_json(const MountConfig& config, const fs::path& destination) {
-    const auto drive = checked_drive(config.drive);
-    validate_pool_name(config.name);
-    if (config.members.empty() || config.members.size() > 16)
-        throw std::invalid_argument("mount config needs 1 to 16 members");
-    const auto base = fs::absolute(destination).lexically_normal().parent_path();
-    std::string output = "{\n  \"schema_version\": 1,\n  \"name\": ";
-    append_json_string(output, config.name);
-    output += ",\n  \"drive\": \"";
-    output.push_back(static_cast<char>(drive));
-    output += ":\",\n  \"require_encrypted\": ";
-    output += config.require_encrypted ? "true" : "false";
-    output += ",\n  \"members\": [\n";
-    for (std::size_t i = 0; i < config.members.size(); ++i) {
-        const auto absolute = (config.members[i].is_absolute() ?
-            config.members[i] : base / config.members[i]).lexically_normal();
-        const auto relative = absolute.lexically_relative(base);
-        const auto stored = !relative.empty() && !relative.has_root_path() ?
-            relative : absolute;
-        output += "    ";
-        append_json_string(output, stored.wstring());
-        output += i + 1 == config.members.size() ? "\n" : ",\n";
-    }
-    output += "  ]\n}\n";
-    if (output.size() > 1024 * 1024)
-        throw std::invalid_argument("mount config exceeds 1 MiB limit");
-    return output;
-}
-
-fs::path normalized_target(const fs::path& path) {
-    std::error_code error;
-    const auto canonical = fs::weakly_canonical(path, error);
-    auto normalized = error ? fs::absolute(path).lexically_normal() : canonical;
-    normalized.make_preferred();
-    return normalized;
-}
-
-bool aliases_member(const fs::path& target, const fs::path& member) {
-    const auto first = normalized_target(target).wstring();
-    const auto second = normalized_target(member).wstring();
-    if (first.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
-        second.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
-        CompareStringOrdinal(first.c_str(), static_cast<int>(first.size()),
-            second.c_str(), static_cast<int>(second.size()), TRUE) == CSTR_EQUAL)
-        return true;
-    std::error_code error;
-    const bool same_file = fs::equivalent(target, member, error);
-    return !error && same_file;
-}
-
 class HandleList {
 public:
     explicit HandleList(std::vector<HANDLE> handles)
@@ -373,17 +302,6 @@ std::vector<wchar_t> mount_environment(const fs::path& winfsp) {
     return result;
 }
 
-void write_exact(HANDLE file, std::string_view bytes) {
-    while (!bytes.empty()) {
-        DWORD written = 0;
-        const auto portion = static_cast<DWORD>(std::min<std::size_t>(
-            bytes.size(), std::numeric_limits<DWORD>::max()));
-        if (!WriteFile(file, bytes.data(), portion, &written, nullptr) || !written)
-            windows_error("cannot write PoolFS mount config");
-        bytes.remove_prefix(written);
-    }
-}
-
 void validate_secret_for_config(const MountConfig& config,
                                 const password::Secret* secret) {
     if (config.members.empty())
@@ -410,63 +328,13 @@ void confirm_config_snapshot(const MountConfig& saved,
         const auto shown = expected.members[i].is_absolute() ?
             expected.members[i] :
             config_path.parent_path() / expected.members[i];
-        if (!aliases_member(saved.members[i], shown))
+        if (!mount_paths_alias(saved.members[i], shown))
             throw std::runtime_error(
                 "mount config changed since it was shown; reload and review it");
     }
 }
 
 } // namespace
-
-void save_mount_config(const MountConfig& config, const fs::path& destination) {
-    if (destination.empty())
-        throw std::invalid_argument("mount config destination is empty");
-    const auto target = fs::absolute(destination).lexically_normal();
-    if (target.filename().empty())
-        throw std::invalid_argument("mount config destination needs a file name");
-    const auto extension = target.extension().wstring();
-    if (CompareStringOrdinal(extension.c_str(),
-            static_cast<int>(extension.size()), L".json", 5, TRUE) != CSTR_EQUAL)
-        throw std::invalid_argument("mount config must use a .json file name");
-    for (const auto& member : config.members) {
-        const auto absolute_member = member.is_absolute() ? member :
-            target.parent_path() / member;
-        if (aliases_member(target, absolute_member))
-            throw std::invalid_argument(
-                "mount config destination aliases a member image");
-    }
-    const auto contents = config_json(config, target);
-    fs::path temporary;
-    UniqueHandle file;
-    for (unsigned attempt = 0; attempt < 100; ++attempt) {
-        temporary = target;
-        temporary += L".poolfs-tmp-" + std::to_wstring(GetCurrentProcessId()) +
-            L"-" + std::to_wstring(GetTickCount64()) + L"-" +
-            std::to_wstring(attempt);
-        file.reset(CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
-            CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
-        if (file.value != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() != ERROR_FILE_EXISTS &&
-            GetLastError() != ERROR_ALREADY_EXISTS)
-            windows_error("cannot create temporary mount config");
-    }
-    if (file.value == INVALID_HANDLE_VALUE)
-        throw std::runtime_error("cannot reserve temporary mount config name");
-    try {
-        write_exact(file.value, contents);
-        if (!FlushFileBuffers(file.value))
-            windows_error("cannot flush temporary mount config");
-        file.reset();
-        (void)load_mount_config(temporary);
-        if (!MoveFileExW(temporary.c_str(), target.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            windows_error("cannot replace mount config");
-    } catch (...) {
-        file.reset();
-        DeleteFileW(temporary.c_str());
-        throw;
-    }
-}
 
 ToolResult discover_config(const fs::path& config_path) {
     if (config_path.empty())

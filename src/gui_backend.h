@@ -26,8 +26,7 @@ struct VerifyResult {
 // Blocking operations are intended for the GUI's worker thread. Configs contain
 // only public paths/options. Passwords stay in Secret and never enter argv,
 // environment variables, JSON, or logs.
-void save_mount_config(const MountConfig& config,
-                       const std::filesystem::path& destination);
+using poolfs::save_mount_config;
 ToolResult discover_config(const std::filesystem::path& config_path);
 bool config_is_encrypted(const MountConfig& config);
 void mount_config(const std::filesystem::path& config_path,

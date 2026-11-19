@@ -155,6 +155,9 @@ The member images contain no host paths, so a complete pool can be moved to
 other drive letters or Windows machines with WinFsp installed. Every member
 recorded at format time is still required. A single-member pool can also be
 created; it cannot compare interrupted journal commits with another member.
+To relocate one member of an unmounted pool, select **Move image…** in the
+manager or use `poolfsctl move-member <config.json> <source.img> <destination.img>`.
+Both update the existing JSON config in place.
 See [portable member images](docs/portable-pools.md) for the move procedure and
 host filesystem limits.
 

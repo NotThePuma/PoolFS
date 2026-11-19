@@ -137,8 +137,16 @@ selected drive's PoolFS mount. **Overview** shows the mount status next to
 the pool's main controls. In **Maintenance**, **Verify data** opens the complete member set
 read-only and scrubs live file data while unmounted. Verification does not
 repair damage. A wrong or incomplete member list cannot mount. Use
-**Save config…** to save a new JSON config after moving images or changing the
-pool name or drive letter.
+**Save config…** after editing the member list, pool name, or drive letter.
+
+To relocate a member, open the saved config and unmount the pool. With all member
+images present, select one in **Member images** and click **Move image…**.
+Choose a new file path on a host volume with enough free space for the entire
+image. PoolFS copies the image,
+saves the new path in the same JSON config, and then removes the original. You
+can reopen or mount the pool using the same config. This works for encrypted
+images without a password. The command-line equivalent is
+`poolfsctl move-member pool.json <source.img> <destination.img>`.
 
 After saving a config, tick **Mount when I sign in to Windows** to mount that
 pool for the current Windows account at the next sign-in. Each saved config has
@@ -195,6 +203,6 @@ prototype and is not exposed for formatting in this GUI. The partition controls 
 [Format-Volume](https://learn.microsoft.com/en-us/powershell/module/storage/format-volume),
 and [Remove-Partition](https://learn.microsoft.com/en-us/powershell/module/storage/remove-partition).
 
-The manager does not delete member images. Remove from list changes only the
-current config draft. See [mount configs](mount-config.md) for the JSON schema
+**Remove** in **Member images** changes only the current config draft.
+See [mount configs](mount-config.md) for the JSON schema
 and [encryption](encryption.md) for the protection boundary.

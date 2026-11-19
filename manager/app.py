@@ -370,6 +370,7 @@ class ManagerWindow(QMainWindow):
         self._images_scanned = False
         self._tasks: set[Task] = set()
         self._running_operation = False
+        self._move_ready = False
         self._health_check: tuple[str, object] | None = None
         self._mounted_drives: set[str] | None = None
         self._stats_previous: dict[str, tuple[float, int, int, int]] = {}
@@ -534,6 +535,11 @@ class ManagerWindow(QMainWindow):
         member_heading.addWidget(label("Member images", "section"), 1)
         self.member_count = label("0 of 16 member images", "muted")
         member_heading.addWidget(self.member_count)
+        self.move_member_button = button("Move image…", self.move_selected_member)
+        self.move_member_button.setToolTip(
+            "Move the selected image and update this config. Save and unmount the pool first."
+        )
+        member_heading.addWidget(self.move_member_button)
         members_box.addLayout(member_heading)
         self.member_empty = label(
             "Choose host volumes for new images, or add images you already have.",
@@ -1280,9 +1286,10 @@ class ManagerWindow(QMainWindow):
         room = len(self.members) < 16
         self.add_existing_button.setEnabled(room)
         self.new_image_button.setEnabled(room)
-        self.remove_member_button.setEnabled(
-            bool(self.members_table.selectionModel().selectedRows())
-        )
+        selected = self.members_table.selectionModel().selectedRows()
+        self.remove_member_button.setEnabled(bool(selected))
+        self.move_member_button.setVisible(bool(self.config_path))
+        self.move_member_button.setEnabled(self._move_ready and len(selected) == 1)
 
     def _member_host(self, member: dict[str, Any]) -> tuple[str, str, str]:
         """Return the host root, stable volume identity, and host filesystem."""
@@ -1569,6 +1576,8 @@ class ManagerWindow(QMainWindow):
         self.mount_button.setEnabled(ready and unmounted and drive_available)
         self.verify_button.setEnabled(ready and unmounted)
         self.grow_button.setEnabled(ready and unmounted)
+        self._move_ready = ready and unmounted
+        self._refresh_member_controls()
         self.reclaim_button.setEnabled(ready and mounted)
         self.unmount_button.setEnabled(self.backend is not None and mounted)
         if not self.members:
@@ -2297,6 +2306,44 @@ class ManagerWindow(QMainWindow):
             self.save_config()
 
         self._run_operation("Creating PoolFS images…", work, completed, failed,
+                            show_progress=True)
+
+    def move_selected_member(self) -> None:
+        rows = self.members_table.selectionModel().selectedRows()
+        if not self._move_ready or len(rows) != 1:
+            return
+        config = self._current_config()
+        backend = self.backend
+        config_path = self.config_path
+        if config is None or backend is None or config_path is None:
+            return
+        source = str(self.members[rows[0].row()]["path"])
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Move PoolFS image and save config", source,
+            "Images (*.img);;All files (*)", options=QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not destination:
+            return
+
+        def work() -> tuple[dict[str, Any], str]:
+            if backend.load_config(config_path) != config:
+                raise BridgeError("The saved config changed. Reopen it before moving an image.")
+            warning = backend.move_member(config_path, source, destination)
+            try:
+                return backend.load_config(config_path), warning
+            except (BridgeError, OSError) as exc:
+                raise BridgeError(f"Move completed and the config was saved. Reopen it to refresh the member list.\n{exc}") from exc
+
+        def completed(result: tuple[dict[str, Any], str]) -> None:
+            self.config, warning = result
+            self.members = [{"path": path, "planned": False} for path in self.config["members"]]
+            self._refresh_members()
+            self._health_check = None
+            self._message(f"Moved {Path(source).name} and saved {Path(config_path).name}.")
+            if warning:
+                QMessageBox.warning(self, "Member moved", warning)
+
+        self._run_operation("Moving member image and saving config…", work, completed,
                             show_progress=True)
 
     def grow_images(self) -> None:

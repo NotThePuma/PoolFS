@@ -26,9 +26,18 @@ A one-member encrypted pool uses the same password prompt:
 ```
 
 Use `poolfsctl unmount P:` and wait for it to finish before disconnecting or
-copying member images. Compare source and destination SHA-256 hashes when
-moving files, then run `poolfs-check` and `poolfs-scrub` with the complete set
-before relying on the copy. Do not mount two writable copies of the same pool
+copying member images. To move one member and update an existing config in place,
+select **Move image…** in the manager or use:
+
+```powershell
+.\build\poolfsctl.exe move-member '.\My Pool.json' 'E:\PoolFS\member-a.img' 'F:\Archive\member-a.img'
+```
+
+The destination must be a new file in an existing folder with enough free space
+to hold the image. PoolFS removes the original after it saves the updated config.
+For a manual copy, compare source and destination SHA-256 hashes. Run `poolfs-check`
+and `poolfs-scrub` with the complete set before relying on the copy. Do not mount
+two writable copies of the same pool
 at once. PoolFS opens writable member images exclusively on Windows to prevent
 two local processes from writing the same images.
 

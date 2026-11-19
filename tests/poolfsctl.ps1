@@ -95,6 +95,12 @@ try {
     $mounted = Invoke-Expected 'managed mount' $controller @('mount', $Drive, $first, $secondDir) 0
     if ($mounted -notmatch 'mounted at') { throw "Mount was not confirmed.`n$mounted" }
     $null = Invoke-Expected 'mounted status' $controller @('status', $Drive) 0
+    $moved = Join-Path $secondDir 'relocated member.img'
+    $null = Invoke-Expected 'reject moving a mounted member' $controller @(
+        'move-member', $healthConfig, $first, $moved) 1
+    if ((Test-Path -LiteralPath $moved) -or -not (Test-Path -LiteralPath $first)) {
+        throw 'Mounted move changed the member paths.'
+    }
     if (-not (Test-Path -LiteralPath $driveRoot)) {
         throw "Managed mount is not visible at $Drive"
     }
@@ -119,17 +125,49 @@ try {
     if ($offline.mounted -or -not $offline.mountable) {
         throw 'Health did not clear mounted status after unmount.'
     }
-    $null = Invoke-Expected 'remount' $controller @('mount', $Drive, $first, $secondDir) 0
+    $configHash = (Get-FileHash -LiteralPath $healthConfig).Hash
+    $firstHash = (Get-FileHash -LiteralPath $first).Hash
+    $secondHash = (Get-FileHash -LiteralPath $second).Hash
+    $null = Invoke-Expected 'reject overwriting a destination' $controller @(
+        'move-member', $healthConfig, $first, $second) 1
+    if ((Get-FileHash -LiteralPath $second).Hash -ne $secondHash) {
+        throw 'Move changed the existing destination.'
+    }
+    $lockedConfig = [IO.File]::Open($healthConfig, 'Open', 'Read', 'Read')
+    try {
+        $failure = Invoke-Expected 'rollback after failed config save' $controller @(
+            'move-member', $healthConfig, $first, $moved) 1
+        if ($failure -notmatch 'cannot replace mount config') { throw $failure }
+    } finally {
+        $lockedConfig.Dispose()
+    }
+    if ((Get-FileHash -LiteralPath $healthConfig).Hash -ne $configHash -or
+        (Get-FileHash -LiteralPath $first).Hash -ne $firstHash -or
+        @(Get-ChildItem -LiteralPath $secondDir -Force).Count -ne 1) {
+        throw 'Failed move changed the original config, source, or destination folder.'
+    }
+    $null = Invoke-Expected 'move member and save config' $controller @(
+        'move-member', $healthConfig, $first, $moved) 0
+    if ((Test-Path -LiteralPath $first) -or (Get-FileHash -LiteralPath $moved).Hash -ne $firstHash) {
+        throw 'Move did not preserve the image bytes or remove the original.'
+    }
+    $after = Invoke-Expected 'relocated pool health' $controller @(
+        'health-config', $healthConfig, '--json') 0 | ConvertFrom-Json
+    if (-not $after.mountable -or $after.members[0].path -ne $moved -or
+        $after.members[1].path -ne $second -or $after.name -ne 'Health test') {
+        throw 'Updated config did not preserve the pool settings and member order.'
+    }
+    $null = Invoke-Expected 'remount from updated config' $controller @('mount-config', $healthConfig) 0
     $content = Get-Content -LiteralPath (Join-Path $driveRoot 'control.txt') -Raw
     if ($content.Trim() -ne 'poolfsctl') { throw 'File changed after managed remount' }
     $null = Invoke-Expected 'final unmount' $controller @('unmount', $Drive) 0
-    $scrub = Invoke-Expected 'offline scrub' $scrubber @($first, $second) 0
-    $check = Invoke-Expected 'offline check' $checker @($first, $second) 0
+    $scrub = Invoke-Expected 'offline scrub' $scrubber @($moved, $second) 0
+    $check = Invoke-Expected 'offline check' $checker @($moved, $second) 0
     if ($scrub -notmatch 'status: CLEAN' -or $check -notmatch 'status: CLEAN') {
         throw 'Managed pool did not pass offline checks'
     }
     $passed = $true
-    Write-Host 'poolfsctl discovery, mount, status, unmount and remount test passed.'
+    Write-Host 'poolfsctl discovery, mount, status, unmount, move and remount test passed.'
 } finally {
     $status = @(& $controller status $Drive 2>&1)
     if ($LASTEXITCODE -eq 0) {

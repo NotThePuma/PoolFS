@@ -156,6 +156,20 @@ class NativeBackend:
     def discover_config(self, path: str) -> dict[str, Any]:
         return self._call("discover_config", path)
 
+    def move_member(self, config: str, source: str, destination: str) -> str:
+        controller = self.path.parent / "poolfsctl.exe"
+        try:
+            result = subprocess.run(
+                [str(controller), "move-member", config, source, destination],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW, check=False,
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError("Moving a member requires poolfsctl.exe beside the native library.") from exc
+        if result.returncode != 0:
+            raise BridgeError(result.stderr.strip() or "Could not move the member image.")
+        return result.stderr.strip()
+
     def health_config(self, path: str) -> dict[str, Any]:
         controller = self.path.parent / "poolfsctl.exe"
         try:

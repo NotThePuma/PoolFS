@@ -260,7 +260,7 @@ def main() -> None:
     assert window._current_config()["name"] == "Travel Pool"
     assert not any(button.isEnabled() for button in (
         window.save_button, window.mount_button, window.verify_button,
-        window.grow_button, window.reclaim_button, window.unmount_button,
+        window.grow_button, window.move_member_button, window.reclaim_button, window.unmount_button,
     ))
     other = str(Path(temporary.path()) / "another" / Path(destination).name)
     assert window.load_config_path(other)
@@ -290,8 +290,12 @@ def main() -> None:
         assert set_startup.call_args_list[-1].args == (image, False)
     assert all(button.isEnabled() for button in (
         window.save_button, window.mount_button, window.verify_button,
-        window.grow_button,
+        window.grow_button, window.move_member_button,
     ))
+    window.members_table.clearSelection()
+    assert not window.move_member_button.isEnabled()
+    window.members_table.selectRow(0)
+    assert window.move_member_button.isEnabled()
     assert not window.reclaim_button.isEnabled()
     assert not window.unmount_button.isEnabled()
 
@@ -299,7 +303,7 @@ def main() -> None:
     window._refresh_mount_state()
     assert not any(button.isEnabled() for button in (
         window.save_button, window.mount_button, window.verify_button,
-        window.grow_button,
+        window.grow_button, window.move_member_button,
     ))
     assert window.reclaim_button.isEnabled()
     assert window.unmount_button.isEnabled()
@@ -311,6 +315,7 @@ def main() -> None:
     fake_backend.mounted_drives = []
     window._refresh_mount_state()
     assert window.mount_button.isEnabled()
+    assert window.move_member_button.isEnabled()
     assert not window.unmount_button.isEnabled()
     assert window.mount_indicator.text() == "P: · Unmounted"
     workspace = PoolWorkspace(fake_backend, auto_refresh=False, settings=settings)
