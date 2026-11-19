@@ -1,5 +1,10 @@
 # PoolFS Manager for Windows
 
+The Windows installer adds PoolFS to your desktop and Start menu. To upgrade,
+unmount your pools, close PoolFS, and run the new installer. The installed app
+keeps the same location so saved sign-in settings can still start it. Open
+your existing JSON config to continue using a pool from a portable copy.
+
 Run `poolfs-manager.exe` from the build or ZIP folder alongside
 `poolfs-gui-native.dll`, `poolfs-mount.exe`, `poolfsctl.exe`, and
 `poolfs-partitions.ps1`. Install the WinFsp runtime before mounting. The

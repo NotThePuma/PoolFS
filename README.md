@@ -30,7 +30,10 @@ behavior and full Windows compatibility remain unverified.
 
 ## Download and source
 
-The current Windows x64 ZIP is available at [poolfs.com](https://poolfs.com/#downloads).
+The Windows x64 installer and portable ZIP are available at [poolfs.com](https://poolfs.com/#downloads).
+Use the installer to add desktop and Start menu shortcuts. Before an in-place
+upgrade, unmount any pools and close PoolFS. Pool images and saved configs
+stay in place. The [WinFsp runtime](https://winfsp.dev/rel/) is required to mount.
 The source is published under the [MIT license](LICENSE). The download and
 source repository are separate: the repository does not contain built binaries.
 See [third-party notices](THIRD_PARTY_NOTICES.md) for dependency licenses.
@@ -83,6 +86,12 @@ Use `-PythonPath` with a different Python installation if needed. Keep
 `poolfs-gui-native.dll`, `poolfs-mount.exe`, `poolfsctl.exe`, and
 `poolfs-partitions.ps1` beside the packaged manager. The native PoolFS backend
 and WinFsp mount remain Windows-only.
+
+To build the installer, install [Inno Setup 6.7 or newer](https://jrsoftware.org/inno-setup/downloads)
+and run `.\build-installer.ps1` after building the native tools and manager.
+It writes `build\poolfs-setup-x64.exe`. Use `-InnoSetupPath` if ISCC.exe is
+installed in a custom location, and `-Version` to set the application version
+shown by Windows. Keep the installer AppId unchanged for in-place upgrades.
 
 For interface development, run `.\.venv\Scripts\python.exe .\manager\app.py`
 after the native build. The DLL locates its helper tools beside itself, even
