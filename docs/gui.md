@@ -153,6 +153,14 @@ read-only and scrubs live file data while unmounted. Verification does not
 repair damage. A wrong or incomplete member list cannot mount. Use
 **Save config…** after editing the member list, pool name, or drive letter.
 
+In **Maintenance**, use **Check journal** on an unmounted pool to inspect the
+metadata and view the checker's report. If the checker finds a single
+interrupted final commit, the report offers **Repair final commit** and shows
+the member paths before you confirm. Back up the images before repairing.
+If a repair was interrupted, reopen **Check journal** to review the result and
+resume it with its undo files present. After mounting, use **Test write…** to
+verify a small write in the destination folder.
+
 To relocate a member, open the saved config and unmount the pool. With all member
 images present, select one in **Member images** and click **Move image…**.
 Choose a new file path on a host volume with enough free space for the entire

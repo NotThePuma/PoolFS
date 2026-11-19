@@ -3,7 +3,7 @@ param(
     [string]$OutputDirectory = 'build',
     [string]$InnoSetupPath,
     [ValidatePattern('^\d{1,4}\.\d{1,4}\.\d{1,4}(\.\d{1,4})?$')]
-    [string]$Version = '6.0.0'
+    [string]$Version = '6.0.1'
 )
 
 $ErrorActionPreference = 'Stop'

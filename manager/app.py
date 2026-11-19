@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget, QAbstractItemView,
 )
 
-from backend import BridgeError, NativeBackend, PartitionRequest
+from backend import BridgeError, JournalReport, NativeBackend, PartitionRequest
 from startup import is_enabled as startup_is_enabled, set_enabled as set_startup_enabled
 
 
@@ -643,12 +643,16 @@ class ManagerWindow(QMainWindow):
         self.encrypt_check.toggled.connect(self._encryption_changed)
         self.save_button = button("Save config…", self.save_config)
         self.mount_button = button("Mount", self.mount_pool, True)
+        self.journal_button = button("Check journal", self.check_journal)
         self.verify_button = button("Verify data", self.verify_pool)
+        self.write_test_button = button("Test write…", self.test_write)
         self.reclaim_button = button("Reclaim space", self.reclaim_space)
         self.unmount_button = button("Unmount", self.unmount_pool)
         self.mount_button.setMinimumWidth(106)
         self.unmount_button.setMinimumWidth(106)
+        self.journal_button.setToolTip("Inspect the unmounted pool's journal and check whether repair is available.")
         self.verify_button.setToolTip("Unmount the pool before checking file data.")
+        self.write_test_button.setToolTip("Write, read back, and remove a small test file on the mounted pool.")
         self.grow_button.setToolTip("Unmount the pool before expanding its member images.")
         self.reclaim_button.setToolTip("Release unused checkpoint space on the mounted pool.")
         for item in (self.create_button, self.mount_button, self.unmount_button):
@@ -656,7 +660,8 @@ class ManagerWindow(QMainWindow):
         details_box.addWidget(self.save_button)
         row = QHBoxLayout()
         row.addWidget(label("Maintenance", "section"), 1)
-        for item in (self.verify_button, self.grow_button, self.reclaim_button):
+        for item in (self.journal_button, self.verify_button, self.write_test_button,
+                     self.grow_button, self.reclaim_button):
             row.addWidget(item)
         actions_box.addLayout(row)
         layout.addLayout(columns)
@@ -1621,7 +1626,9 @@ class ManagerWindow(QMainWindow):
         self.unmount_button.setVisible(mounted)
         self.save_button.setVisible(bool(self.config_path))
         self.mount_button.setEnabled(ready and unmounted and drive_available)
+        self.journal_button.setEnabled(ready and unmounted)
         self.verify_button.setEnabled(ready and unmounted)
+        self.write_test_button.setEnabled(ready and mounted)
         self.grow_button.setEnabled(ready and unmounted)
         self._move_ready = ready and unmounted
         self._refresh_member_controls()
@@ -2595,7 +2602,7 @@ class ManagerWindow(QMainWindow):
             self._error("Native PoolFS bridge is unavailable.")
             return None
         if not self.config_path:
-            self._error("Save a JSON config before mounting or verifying.")
+            self._error("Save a JSON config before continuing.")
             return None
         current = {
             "name": self.pool_name.text(),
@@ -2645,6 +2652,98 @@ class ManagerWindow(QMainWindow):
             QTimer.singleShot(50, self, self._quit_after_startup)
             return
         QApplication.quit()
+
+    def check_journal(self) -> None:
+        config = self._current_config()
+        if config is not None and self.config_path is not None:
+            self._run_journal_check(self.config_path, config)
+
+    def _run_journal_check(
+        self, path: str, config: dict[str, Any], *, repair: bool = False
+    ) -> None:
+        backend = self.backend
+        if backend is None:
+            return
+        encryption = self._call_sync(
+            "Inspecting pool encryption…", lambda: backend.config_is_encrypted(path),
+        )
+        if encryption is None:
+            return
+        password = self._password("Unlock journal") if encryption.get("encrypted") else None
+        if encryption.get("encrypted") and password is None:
+            return
+        secret_holder = [password]
+        password = None
+
+        def work() -> JournalReport:
+            try:
+                return backend.check_journal(path, config, secret_holder[0], repair=repair)
+            finally:
+                secret_holder[0] = None
+
+        def completed(report: JournalReport) -> None:
+            if self._show_journal_report(report, config["members"], offer_repair=not repair):
+                self._run_journal_check(path, config, repair=True)
+
+        activity = "Repairing PoolFS journal…" if repair else "Checking PoolFS journal…"
+        self._run_operation(activity, work, completed)
+
+    def _show_journal_report(
+        self, report: JournalReport, members: list[str], *, offer_repair: bool
+    ) -> bool:
+        status = report.status
+        summaries = {
+            "CLEAN": ("Journal is clean", "The journal structure passed inspection. Use Verify data to check file contents."),
+            "REPAIRED": ("Journal repaired", "PoolFS reopened the repaired member set. Mount the pool and use Test write."),
+            "INTERRUPTED_FINAL_COMMIT": (
+                "Interrupted final commit",
+                "PoolFS can discard the one uncertain final operation. "
+                "Back up the member images before repairing.",
+            ),
+            "PENDING_REPAIR": (
+                "Repair was interrupted",
+                "Keep the member images and their undo files together. "
+                "Resuming uses those undo files before retrying the repair.",
+            ),
+            "CORRUPT": ("Journal check found damage", "Keep the pool unmounted. See the checker details for the reason."),
+            "ERROR": ("Journal operation failed", "See the checker details for the cause."),
+        }
+        title, summary = summaries[status]
+        self._message(title)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("PoolFS journal")
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText(title)
+        dialog.setIcon(QMessageBox.Icon.Information if status in ("CLEAN", "REPAIRED")
+                       else QMessageBox.Icon.Warning)
+        dialog.setDetailedText(report.details)
+        close = dialog.addButton(QMessageBox.StandardButton.Close)
+        dialog.setDefaultButton(close)
+        dialog.setEscapeButton(close)
+        repair_button = None
+        if offer_repair and len(members) > 1 and status in ("INTERRUPTED_FINAL_COMMIT", "PENDING_REPAIR"):
+            summary += "\n\nMember images\n" + "\n".join(members)
+            repair_label = "Resume repair" if status == "PENDING_REPAIR" else "Repair final commit"
+            repair_button = dialog.addButton(repair_label, QMessageBox.ButtonRole.DestructiveRole)
+        dialog.setInformativeText(summary)
+        dialog.exec()
+        return repair_button is not None and dialog.clickedButton() is repair_button
+
+    def test_write(self) -> None:
+        config = self._current_config()
+        backend = self.backend
+        if config is None or backend is None:
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder to test", config["drive"] + "\\")
+        if not folder:
+            return
+
+        def completed(_: None) -> None:
+            message = f"PoolFS wrote, read back, and removed a test file in {folder}."
+            self._message(f"Write test passed on {config['drive']}")
+            QMessageBox.information(self, "Write test passed", message)
+
+        self._run_operation("Testing PoolFS writes…", lambda: backend.test_write(config, folder), completed)
 
     def verify_pool(self) -> None:
         config = self._current_config()

@@ -26,6 +26,11 @@
 
 namespace {
 
+std::string path_text(const std::filesystem::path& path) {
+    const auto utf8 = path.u8string();
+    return {utf8.begin(), utf8.end()};
+}
+
 using Byte = std::uint8_t;
 using Block = std::array<Byte, 4096>;
 using Identity = std::array<Byte, 16>;
@@ -109,13 +114,13 @@ public:
                               FILE_FLAG_RANDOM_ACCESS, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE)
             throw std::runtime_error("cannot open member exclusively (unmount it first): " +
-                                     path_.string() + " (Windows error " +
+                                     path_text(path_) + " (Windows error " +
                                      std::to_string(GetLastError()) + ")");
         LARGE_INTEGER length{};
         if (!GetFileSizeEx(handle_, &length) || length.QuadPart < 0) {
             CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
-            throw std::runtime_error("cannot read member size: " + path_.string());
+            throw std::runtime_error("cannot read member size: " + path_text(path_));
         }
         size_ = static_cast<std::uint64_t>(length.QuadPart);
     }
@@ -127,12 +132,12 @@ public:
     void read_raw(std::uint64_t offset, Byte* bytes, std::size_t count) {
         if (offset > size_ || count > size_ - offset ||
             count > std::numeric_limits<DWORD>::max())
-            throw Corrupt("member read exceeds image length: " + path_.string());
+            throw Corrupt("member read exceeds image length: " + path_text(path_));
         seek(offset);
         DWORD received = 0;
         if (!ReadFile(handle_, bytes, static_cast<DWORD>(count), &received, nullptr) ||
             received != count)
-            throw std::runtime_error("cannot read member: " + path_.string());
+            throw std::runtime_error("cannot read member: " + path_text(path_));
     }
     void enable_encryption(std::span<const std::byte, 64> key, std::uint8_t member_index) {
         if (cipher_) throw std::logic_error("member encryption already initialized");
@@ -154,7 +159,7 @@ public:
             return;
         }
         if (offset > size_ || count > size_ - offset)
-            throw Corrupt("member read exceeds image length: " + path_.string());
+            throw Corrupt("member read exceeds image length: " + path_text(path_));
         while (count) {
             const auto block_offset = offset - offset % kBlockBytes;
             Block raw{};
@@ -186,9 +191,9 @@ public:
         DWORD written = 0;
         if (!WriteFile(handle_, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) ||
             written != bytes.size())
-            throw std::runtime_error("cannot write repair marker: " + path_.string());
+            throw std::runtime_error("cannot write repair marker: " + path_text(path_));
         if (!FlushFileBuffers(handle_))
-            throw std::runtime_error("cannot flush repaired member: " + path_.string());
+            throw std::runtime_error("cannot flush repaired member: " + path_text(path_));
     }
     void zero_block(std::uint64_t offset) { write_raw_block(offset, Block{}); }
 private:
@@ -198,7 +203,7 @@ private:
         LARGE_INTEGER position{};
         position.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(handle_, position, nullptr, FILE_BEGIN))
-            throw std::runtime_error("cannot seek member: " + path_.string());
+            throw std::runtime_error("cannot seek member: " + path_text(path_));
     }
     std::filesystem::path path_;
     bool writable_ = false;
@@ -523,7 +528,7 @@ Report inspect(std::vector<Member>& members, bool output) {
         if (report.order[h.index]) throw Corrupt("duplicate member index supplied");
         report.order[h.index] = &member;
         if (output)
-            std::cout << "  member[" << unsigned(h.index) << "]: " << member.image->path().string()
+            std::cout << "  member[" << unsigned(h.index) << "]: " << path_text(member.image->path())
                       << ", bytes=" << h.bytes << ", header_copies="
                       << member.valid_header_copies << "/2\n";
     }
@@ -665,7 +670,7 @@ UndoBytes encode_undo(const Undo& undo) {
 }
 Undo decode_undo(const std::filesystem::path& path) {
     Image file(path, false);
-    if (file.size() != kUndoBytes) throw Corrupt("undo sidecar has wrong length: " + path.string());
+    if (file.size() != kUndoBytes) throw Corrupt("undo sidecar has wrong length: " + path_text(path));
     UndoBytes bytes{};
     file.read(0, bytes.data(), bytes.size());
     constexpr std::array<Byte, 7> magic_prefix{'P','F','S','U','N','D','O'};
@@ -676,11 +681,11 @@ Undo decode_undo(const std::filesystem::path& path) {
         !((sidecar_format == 1 && bytes[46] == 0) || encrypted) || bytes[47] ||
         !std::all_of(bytes.begin() + kUndoRecordOffset + kBlockBytes, bytes.end(),
                      [](Byte value) { return value == 0; }))
-        throw Corrupt("undo sidecar header or padding is invalid: " + path.string());
+        throw Corrupt("undo sidecar header or padding is invalid: " + path_text(path));
     const auto stored_hash = number64(bytes.data() + 72);
     std::fill_n(bytes.begin() + 72, 8, 0);
     if (stored_hash != fnv64(bytes.data(), bytes.size()))
-        throw Corrupt("undo sidecar checksum mismatch: " + path.string());
+        throw Corrupt("undo sidecar checksum mismatch: " + path_text(path));
     Undo undo;
     undo.path = path;
     undo.version = version;
@@ -696,13 +701,13 @@ Undo decode_undo(const std::filesystem::path& path) {
     if (!undo.generation || undo.epoch > 1 ||
         (!undo.encrypted &&
          !record_error(undo.record, undo.sequence, undo.version).empty()))
-        throw Corrupt("undo sidecar contains an invalid journal record: " + path.string());
+        throw Corrupt("undo sidecar contains an invalid journal record: " + path_text(path));
     return undo;
 }
 
 void delete_file(const std::filesystem::path& path) {
     if (!DeleteFileW(path.c_str()))
-        throw std::runtime_error("cannot remove repair sidecar: " + path.string() +
+        throw std::runtime_error("cannot remove repair sidecar: " + path_text(path) +
                                  " (Windows error " + std::to_string(GetLastError()) + ")");
 }
 void prepare_undo(const Undo& undo) {
@@ -712,16 +717,16 @@ void prepare_undo(const Undo& undo) {
                                 CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
                                 nullptr);
     if (handle == INVALID_HANDLE_VALUE)
-        throw std::runtime_error("cannot stage repair sidecar: " + temp.string());
+        throw std::runtime_error("cannot stage repair sidecar: " + path_text(temp));
     DWORD written = 0;
     const bool success = WriteFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()),
                                    &written, nullptr) && written == bytes.size() &&
                          FlushFileBuffers(handle);
     CloseHandle(handle);
     if (!success)
-        throw std::runtime_error("cannot durably write repair sidecar: " + temp.string());
+        throw std::runtime_error("cannot durably write repair sidecar: " + path_text(temp));
     if (!MoveFileExW(temp.c_str(), undo.path.c_str(), MOVEFILE_WRITE_THROUGH))
-        throw std::runtime_error("cannot commit repair sidecar: " + undo.path.string());
+        throw std::runtime_error("cannot commit repair sidecar: " + path_text(undo.path));
     const auto verified = decode_undo(undo.path);
     if (verified.version != undo.version || verified.encrypted != undo.encrypted ||
         verified.pool_id != undo.pool_id ||
@@ -742,7 +747,7 @@ std::vector<Undo> pending_undos(const std::vector<Member>& members) {
             undo.pool_id != member.header.pool_id ||
             undo.member_id != member.header.member_id ||
             undo.member_index != member.header.index)
-            throw Corrupt("repair sidecar does not match its member: " + path.string());
+            throw Corrupt("repair sidecar does not match its member: " + path_text(path));
         pending.push_back(std::move(undo));
     }
     return pending;
@@ -757,7 +762,7 @@ Block undo_plaintext(const Undo& undo, const std::vector<Member>& members) {
     const auto plain = it->image->decrypt_raw_block(undo.offset, undo.record);
     if (!record_error(plain, undo.sequence, undo.version).empty())
         throw Corrupt("repair sidecar contains an invalid journal record: " +
-                      undo.path.string());
+                      path_text(undo.path));
     return plain;
 }
 
@@ -877,9 +882,13 @@ void resume_pending_undos(std::vector<Member>& members,
               << " original journal record(s) from durable sidecars\n";
 }
 
-int main_impl(int argc, char** argv) {
-    const bool repair = argc >= 2 && std::string_view(argv[1]) == "--repair-final-tail";
-    const int first_path = repair ? 2 : 1;
+int main_impl(int argc, wchar_t** argv) {
+    int first_path = 1;
+    const bool repair = argc > first_path && std::wstring_view(argv[first_path]) == L"--repair-final-tail";
+    if (repair) ++first_path;
+    const bool password_stdin = argc > first_path &&
+        std::wstring_view(argv[first_path]) == L"--password-stdin";
+    if (password_stdin) ++first_path;
     const int count = argc - first_path;
     if (count < 1 || count > static_cast<int>(kMaximumMembers)) {
         std::cerr << "Usage: poolfs-check <member.img> [up to 16 members]\n"
@@ -902,11 +911,11 @@ int main_impl(int argc, char** argv) {
         try {
             members.push_back(read_member(std::make_unique<Image>(path, repair)));
         } catch (const Corrupt& error) {
-            std::cout << "  supplied[" << (i - first_path) << "]: " << path.string()
+            std::cout << "  supplied[" << (i - first_path) << "]: " << path_text(path)
                       << " (invalid: " << error.what() << ")\n";
             corrupt_problem = true;
         } catch (const std::exception& error) {
-            std::cout << "  supplied[" << (i - first_path) << "]: " << path.string()
+            std::cout << "  supplied[" << (i - first_path) << "]: " << path_text(path)
                       << " (unavailable: " << error.what() << ")\n";
             io_problem = true;
         }
@@ -925,7 +934,11 @@ int main_impl(int argc, char** argv) {
                       "automatic final-tail repair is unavailable and no changes were made");
     std::optional<poolfs::password::Secret> secret;
     if (members.front().header.encrypted()) {
-        secret.emplace(poolfs::password::prompt(L"PoolFS password: "));
+        const auto input = GetStdHandle(STD_INPUT_HANDLE);
+        if (password_stdin && GetFileType(input) != FILE_TYPE_PIPE)
+            throw std::runtime_error("checker password input requires a pipe");
+        secret.emplace(password_stdin ? poolfs::password::read_pipe(input)
+                                     : poolfs::password::prompt(L"PoolFS password: "));
         const auto& header = members.front().header;
         const auto keys = poolfs::crypto::derive_keys(
             secret->view(), header.salt, header.kdf_iterations);
@@ -1024,7 +1037,7 @@ int main_impl(int argc, char** argv) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int wmain(int argc, wchar_t** argv) {
     try {
         return main_impl(argc, argv);
     } catch (const Corrupt& error) {

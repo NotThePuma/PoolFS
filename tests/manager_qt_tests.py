@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, QSettings, QTemporaryDir, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTableWidgetItem  # noqa: E402
 from app import MIB, POOL_USAGE_ROLE, ManagerWindow, PoolWorkspace, validate_pool_name  # noqa: E402
+from backend import JournalReport  # noqa: E402
 
 
 def check_member_names(window: ManagerWindow) -> None:
@@ -180,6 +181,36 @@ def check_discovered_pool_flow(window: ManagerWindow) -> None:
     window.backend.mounted_drives = []  # type: ignore[attr-defined]
 
 
+def check_journal_dialog(window: ManagerWindow) -> None:
+    members = [r"H:\PoolFS\member-1.img", r"F:\PoolFS\member-1.img"]
+    exec_dialog = QMessageBox.exec
+
+    def check(status: str, repair_label: str | None = None, confirm: bool = False) -> None:
+        def respond(dialog: QMessageBox) -> int:
+            repair = [button for button in dialog.buttons()
+                      if dialog.buttonRole(button) == QMessageBox.ButtonRole.DestructiveRole]
+            assert [button.text() for button in repair] == ([repair_label] if repair_label else [])
+            assert dialog.detailedText() == f"status: {status}"
+            if repair:
+                assert all(path in dialog.informativeText() for path in members)
+                assert dialog.defaultButton() is dialog.button(QMessageBox.StandardButton.Close)
+            clicked = repair[0] if confirm else dialog.defaultButton()
+            QTimer.singleShot(0, clicked.click)
+            return exec_dialog(dialog)
+
+        with patch.object(QMessageBox, "exec", respond):
+            report = JournalReport(status, f"status: {status}")
+            assert window._show_journal_report(report, members, offer_repair=True) == confirm
+
+    check("CLEAN")
+    check("CORRUPT")
+    check("ERROR")
+    check("INTERRUPTED_FINAL_COMMIT", "Repair final commit")
+    check("INTERRUPTED_FINAL_COMMIT", "Repair final commit", confirm=True)
+    check("PENDING_REPAIR", "Resume repair", confirm=True)
+    check("REPAIRED")
+
+
 def main() -> None:
     application = QApplication([])
     temporary = QTemporaryDir()
@@ -209,6 +240,7 @@ def main() -> None:
             raise AssertionError(f"Invalid pool name was accepted: {invalid!r}")
 
     check_member_names(window)
+    check_journal_dialog(window)
 
     saved: list[tuple[object, ...]] = []
 
@@ -261,6 +293,7 @@ def main() -> None:
     assert not any(button.isEnabled() for button in (
         window.save_button, window.mount_button, window.verify_button,
         window.grow_button, window.move_member_button, window.reclaim_button, window.unmount_button,
+        window.journal_button, window.write_test_button,
     ))
     other = str(Path(temporary.path()) / "another" / Path(destination).name)
     assert window.load_config_path(other)
@@ -290,8 +323,9 @@ def main() -> None:
         assert set_startup.call_args_list[-1].args == (image, False)
     assert all(button.isEnabled() for button in (
         window.save_button, window.mount_button, window.verify_button,
-        window.grow_button, window.move_member_button,
+        window.grow_button, window.move_member_button, window.journal_button,
     ))
+    assert not window.write_test_button.isEnabled()
     window.members_table.clearSelection()
     assert not window.move_member_button.isEnabled()
     window.members_table.selectRow(0)
@@ -303,8 +337,9 @@ def main() -> None:
     window._refresh_mount_state()
     assert not any(button.isEnabled() for button in (
         window.save_button, window.mount_button, window.verify_button,
-        window.grow_button, window.move_member_button,
+        window.grow_button, window.move_member_button, window.journal_button,
     ))
+    assert window.write_test_button.isEnabled()
     assert window.reclaim_button.isEnabled()
     assert window.unmount_button.isEnabled()
     assert window.mount_indicator.text() == "P: · PoolFS mounted"

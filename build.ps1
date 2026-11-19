@@ -112,7 +112,7 @@ Invoke-Build ($common + @('-DPOOLFS_CRASH_V6', $core, $crypto, $rawDevice, $v4Cr
     '-lbcrypt', '-ladvapi32', '-o', (Join-Path $output 'poolfs-v6-crash-tests.exe')))
 Invoke-Build ($common + @('-DPOOLFS_CRASH_V6_ENCRYPTED', $core, $crypto, $rawDevice, $v4CrashTests,
     '-lbcrypt', '-ladvapi32', '-o', (Join-Path $output 'poolfs-v6-encrypted-crash-tests.exe')))
-Invoke-Build ($common + @($core, $crypto, $password, $rawDevice, $checker, '-lbcrypt', '-ladvapi32',
+Invoke-Build ($common + @('-municode', $core, $crypto, $password, $rawDevice, $checker, '-lbcrypt', '-ladvapi32',
     '-o', (Join-Path $output 'poolfs-check.exe')))
 Invoke-Build ($common + @($core, $crypto, $password, $rawDevice, $scrubberV6, '-lbcrypt', '-ladvapi32',
     '-o', (Join-Path $output 'poolfs-scrub.exe')))

@@ -11,12 +11,20 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 
 class BridgeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class JournalReport:
+    status: str
+    details: str
 
 
 class PartitionRequest(ctypes.Structure):
@@ -249,6 +257,76 @@ class NativeBackend:
         self, path: str, password: str | None
     ) -> dict[str, Any]:
         return self._password_call("verify_config", (path,), password)
+
+    def check_journal(
+        self, path: str, config: dict[str, Any], password: str | None, *, repair: bool = False
+    ) -> JournalReport:
+        if self.load_config(path) != config:
+            raise BridgeError("The saved config changed. Reopen it before checking the journal.")
+
+        checker = self.path.parent / "poolfs-check.exe"
+        arguments = [str(checker)]
+        if repair:
+            arguments.append("--repair-final-tail")
+        arguments.extend(("--password-stdin", *config["members"]))
+        secret = bytearray(password or "", "utf-8")
+        try:
+            if secret:
+                secret[:0] = len(secret).to_bytes(4, "little")
+            result = subprocess.run(
+                arguments, input=secret, capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW, check=False,
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError("Journal checks need poolfs-check.exe beside the PoolFS native library.") from exc
+        finally:
+            secret[:] = bytes(len(secret))
+
+        details = "\n".join(
+            output.decode("utf-8", errors="replace").strip()
+            for output in (result.stdout, result.stderr) if output
+        )
+        status = next((line.removeprefix("status: ") for line in reversed(details.splitlines())
+                       if line.startswith("status: ")), "")
+        exit_codes = {"CLEAN": 0, "INTERRUPTED_FINAL_COMMIT": 2, "PENDING_REPAIR": 3,
+                      "CORRUPT": 3, "ERROR": 1, "REPAIRED": 0}
+        if exit_codes.get(status) != result.returncode or (status == "REPAIRED" and not repair):
+            raise BridgeError(details or f"PoolFS journal checker exited with code {result.returncode}.")
+        return JournalReport(status, details)
+
+    def test_write(self, config: dict[str, Any], folder: str) -> None:
+        drive = config["drive"]
+        # PoolFS has no reparse points, and realpath cannot resolve its WinFsp volume.
+        directory = Path(os.path.abspath(folder))
+        if directory.drive.upper() != drive or not directory.is_dir():
+            raise BridgeError(f"Choose a folder on the mounted PoolFS drive {drive}.")
+        if self.match_mount(drive, config) is not True:
+            raise BridgeError(f"Could not confirm that this pool is mounted on {drive}.")
+
+        payload = b"PoolFS write test\n"
+        probe = None
+        failure = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=directory, prefix="poolfs-write-test-", suffix=".tmp", delete=False
+            ) as stream:
+                probe = Path(stream.name)
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+                stream.seek(0)
+                if stream.read() != payload:
+                    raise BridgeError("The test file contents did not match the written data.")
+        except (OSError, BridgeError) as exc:
+            failure = exc
+        if probe is not None:
+            try:
+                probe.unlink()
+            except OSError as exc:
+                cleanup_error = f"Could not remove the test file {probe}. {exc}"
+                raise BridgeError(f"{failure}\n{cleanup_error}" if failure else cleanup_error) from exc
+        if failure:
+            raise failure
 
     def mounts(self) -> dict[str, Any]:
         return self._call("mounts")
