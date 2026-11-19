@@ -117,9 +117,29 @@ try {
         throw 'Health treated an incomplete config as the mounted pool.'
     }
     Set-Content -LiteralPath (Join-Path $driveRoot 'control.txt') -Value 'poolfsctl'
+    $before = Invoke-Expected 'stats before benchmark' $controller @(
+        'stats', $Drive, '--interval-ms', '100', '--json') 0 | ConvertFrom-Json
+    $benchmark = Invoke-Expected 'mounted benchmark' $controller @(
+        'benchmark', $Drive, '--size-mib', '8', '--json') 0 | ConvertFrom-Json
+    if ($benchmark.drive -ne $Drive -or $benchmark.sizeMiB -ne 8 -or
+        $benchmark.readMiBPerSecond -le 0 -or $benchmark.writeMiBPerSecond -le 0) {
+        throw 'Benchmark did not report the requested size and both rates.'
+    }
+    $null = Invoke-Expected 'benchmark rejects insufficient space' $controller @(
+        'benchmark', $Drive, '--size-mib', '1024') 1
+    $afterBenchmark = Invoke-Expected 'stats after benchmark' $controller @(
+        'stats', $Drive, '--interval-ms', '100', '--json') 0 | ConvertFrom-Json
+    if ($afterBenchmark.readBytes - $before.readBytes -lt 8MB -or
+        $afterBenchmark.writeBytes - $before.writeBytes -lt 8MB) {
+        throw 'The mounted benchmark did not exercise managed read and write I/O.'
+    }
+    if (@(Get-ChildItem -LiteralPath $driveRoot -Filter 'poolfs-benchmark-*.tmp' -Force).Count) {
+        throw 'A benchmark file remained on the mounted pool.'
+    }
     $null = Invoke-Expected 'managed unmount' $controller @('unmount', $Drive) 0
     if (Test-Path -LiteralPath $driveRoot) { throw "$Drive stayed mounted" }
     $null = Invoke-Expected 'unmounted status' $controller @('status', $Drive) 1
+    $null = Invoke-Expected 'unmounted benchmark rejected' $controller @('benchmark', $Drive) 1
     $offline = Invoke-Expected 'unmounted pool health' $controller @(
         'health-config', $healthConfig, '--json') 0 | ConvertFrom-Json
     if ($offline.mounted -or -not $offline.mountable) {
@@ -167,7 +187,7 @@ try {
         throw 'Managed pool did not pass offline checks'
     }
     $passed = $true
-    Write-Host 'poolfsctl discovery, mount, status, unmount, move and remount test passed.'
+    Write-Host 'poolfsctl discovery, mount, benchmark, unmount, move and remount test passed.'
 } finally {
     $status = @(& $controller status $Drive 2>&1)
     if ($LASTEXITCODE -eq 0) {

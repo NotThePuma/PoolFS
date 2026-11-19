@@ -834,6 +834,26 @@ class ManagerWindow(QMainWindow):
         rates.addWidget(write_card, 1)
         layout.addLayout(rates)
 
+        benchmark_card, benchmark_box = card()
+        benchmark_row = QHBoxLayout()
+        benchmark_row.addWidget(label("Read/write benchmark", "section"), 1)
+        self.benchmark_size = QSpinBox()
+        self.benchmark_size.setRange(1, 1024)
+        self.benchmark_size.setValue(32)
+        self.benchmark_size.setSuffix(" MiB")
+        self.benchmark_size.setAccessibleName("Benchmark file size")
+        self.benchmark_size.setEnabled(False)
+        benchmark_row.addWidget(self.benchmark_size)
+        self.benchmark_button = button("Run benchmark", self._run_benchmark)
+        self.benchmark_button.setEnabled(False)
+        benchmark_row.addWidget(self.benchmark_button)
+        benchmark_box.addLayout(benchmark_row)
+        benchmark_box.addWidget(label("Measures sequential I/O using a temporary file on the selected drive.", "muted", True))
+        self.benchmark_status = label("", "muted", True)
+        self.benchmark_status.hide()
+        benchmark_box.addWidget(self.benchmark_status)
+        layout.addWidget(benchmark_card)
+
         graph_card, graph_box = card()
         graph_box.addWidget(label("Recent speed · last 60 seconds", "section"))
         graph_box.addWidget(label(
@@ -1410,6 +1430,9 @@ class ManagerWindow(QMainWindow):
     def _stats_drive_changed(self) -> None:
         self._clear_stats()
         drive = self.stats_drive.currentText()
+        self.benchmark_size.setEnabled(bool(drive) and self.backend is not None)
+        self.benchmark_button.setEnabled(bool(drive) and self.backend is not None)
+        self.benchmark_status.hide()
         if drive:
             self._stats_previous.pop(drive, None)
             self.stats_status.setText("Measuring activity on " + drive + "…")
@@ -1441,6 +1464,30 @@ class ManagerWindow(QMainWindow):
     def _refresh_stats(self) -> None:
         self._refresh_mount_state()
         self._poll_stats()
+
+    def _run_benchmark(self) -> None:
+        drive = self.stats_drive.currentText()
+        backend = self.backend
+        if backend is None or drive not in (self._mounted_drives or set()):
+            return
+        if self._running_operation or (self.workspace and self.workspace.operation_in_progress()):
+            self._message("Wait for the current PoolFS operation to finish.")
+            return
+        size = self.benchmark_size.value()
+
+        def report(text: str) -> None:
+            self.benchmark_status.setText(text)
+            self.benchmark_status.show()
+            self._message(text)
+
+        def completed(result: dict[str, Any]) -> None:
+            report(f"{drive} · Read {result['readMiBPerSecond']:,.2f} MiB/s · "
+                   f"Write {result['writeMiBPerSecond']:,.2f} MiB/s · {result['sizeMiB']:,} MiB tested")
+
+        activity = f"Benchmarking {drive} with a {size:,} MiB file…"
+        report(activity)
+        self._run_operation(activity, lambda: backend.benchmark(drive, size), completed,
+                            lambda message: report(f"{drive} · {message}"), show_progress=True)
 
     def _poll_stats(self) -> None:
         if self.workspace and self.workspace.pool_stack.currentWidget() is not self:

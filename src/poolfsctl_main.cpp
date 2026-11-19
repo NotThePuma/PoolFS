@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include "benchmark_io.h"
 #include "mount_config.h"
 #include "mount_stats.h"
 #include "password.h"
@@ -29,6 +30,9 @@ namespace {
 
 namespace fs = std::filesystem;
 constexpr std::uint64_t kMinimumMemberBytes = 384ULL * 1024 * 1024;
+constexpr DWORD kBenchmarkChunkBytes = 1024 * 1024;
+constexpr unsigned kBenchmarkDefaultMiB = 32;
+constexpr unsigned kBenchmarkMaximumMiB = 1024;
 constexpr std::size_t kBlockBytes = 4096;
 constexpr std::size_t kManifestOffset = 64;
 constexpr std::size_t kManifestEntryBytes = 24;
@@ -830,6 +834,90 @@ void managed_stats(wchar_t drive, DWORD interval_ms, bool watch, bool json) {
     } while (watch);
 }
 
+void managed_benchmark(wchar_t drive, unsigned size_mib, bool json) {
+    namespace io = poolfs::benchmark_io;
+    if (!active(drive))
+        throw std::runtime_error("benchmark requires a mounted PoolFS drive in this Windows session");
+    const auto available = poolfs::mount_stats::Read(drive).available_bytes;
+    if (available < std::uint64_t{size_mib} * kBenchmarkChunkBytes)
+        throw std::runtime_error("not enough free space for the benchmark file; choose a smaller size");
+
+    const auto path = std::wstring(1, drive) + L":\\poolfs-benchmark-" +
+        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".tmp";
+    auto file = io::open_file(path, GENERIC_READ | GENERIC_WRITE | DELETE, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_DELETE_ON_CLOSE);
+    std::array<wchar_t, 64> filesystem{};
+    if (!GetVolumeInformationByHandleW(file.get(), nullptr, 0, nullptr, nullptr,
+                                      nullptr, filesystem.data(), filesystem.size()))
+        windows_error("cannot identify the benchmark file's volume");
+    if (std::wstring_view(filesystem.data()) != L"PoolFS")
+        throw std::runtime_error("benchmark drive changed before the test could start");
+
+    io::Buffer write_buffer(kBenchmarkChunkBytes), read_buffer(kBenchmarkChunkBytes);
+    auto* pattern = static_cast<unsigned char*>(write_buffer.get());
+    std::uint32_t state = 0x675213be;
+    for (DWORD i = 0; i < kBenchmarkChunkBytes; ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        pattern[i] = static_cast<unsigned char>(state);
+    }
+
+    const io::Clock clock;
+    const auto write_start = clock.now();
+    for (std::uint32_t block = 0; block < size_mib; ++block) {
+        std::memcpy(pattern, &block, sizeof(block));
+        io::write_exact(file.get(), pattern, kBenchmarkChunkBytes);
+    }
+    io::flush(file.get());
+    const double write_ms = clock.milliseconds(write_start);
+    io::seek(file.get(), 0);
+    double read_ms = 0;
+    for (std::uint32_t block = 0; block < size_mib; ++block) {
+        const auto read_start = clock.now();
+        io::read_exact(file.get(), read_buffer.get(), kBenchmarkChunkBytes);
+        read_ms += clock.milliseconds(read_start);
+        std::memcpy(pattern, &block, sizeof(block));
+        if (std::memcmp(read_buffer.get(), pattern, kBenchmarkChunkBytes) != 0)
+            throw std::runtime_error("benchmark read-back data did not match the written file");
+    }
+    file.close();
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        throw std::runtime_error("benchmark file was not removed on close");
+    if (GetLastError() != ERROR_FILE_NOT_FOUND)
+        windows_error("cannot confirm that the benchmark file was removed");
+    if (write_ms <= 0 || read_ms <= 0)
+        throw std::runtime_error("benchmark timer did not advance");
+
+    const double write_rate = size_mib * 1000.0 / write_ms;
+    const double read_rate = size_mib * 1000.0 / read_ms;
+    std::wcout << std::fixed << std::setprecision(2);
+    if (json) {
+        std::wcout << L"{\"drive\":\"" << drive << L":\",\"sizeMiB\":" << size_mib
+                   << L",\"writeMiBPerSecond\":" << write_rate
+                   << L",\"readMiBPerSecond\":" << read_rate << L"}\n";
+    } else {
+        std::wcout << drive << L":  " << size_mib << L" MiB sequential benchmark\n"
+                   << L"  Write " << write_rate << L" MiB/s (includes flush)\n"
+                   << L"  Read  " << read_rate << L" MiB/s (verified)\n";
+    }
+}
+
+unsigned benchmark_size(std::wstring_view value) {
+    unsigned size = 0;
+    for (const wchar_t digit : value) {
+        if (digit < L'0' || digit > L'9') {
+            size = 0;
+            break;
+        }
+        size = size * 10 + static_cast<unsigned>(digit - L'0');
+        if (size > kBenchmarkMaximumMiB) break;
+    }
+    if (size == 0 || size > kBenchmarkMaximumMiB)
+        throw std::invalid_argument("benchmark size must be 1 to 1024 MiB");
+    return size;
+}
+
 void usage() {
     std::wcerr << L"Usage: poolfsctl discover <seed.img> [search-root ...]\n"
                << L"       poolfsctl discover-config <config.json>\n"
@@ -840,6 +928,7 @@ void usage() {
                << L"       poolfsctl unmount <drive:>\n"
                << L"       poolfsctl reclaim <drive:>\n"
                << L"       poolfsctl stats <drive:> [--json] [--watch] [--interval-ms 1000]\n"
+               << L"       poolfsctl benchmark <drive:> [--size-mib 32] [--json]\n"
                << L"       poolfsctl health-config <config.json> [--json]\n"
                << L"       poolfsctl move-member <config.json> <source.img> <destination.img>\n"
                << L"Positional discovery searches the seed folder and each drive's PoolFS folder.\n"
@@ -848,6 +937,19 @@ void usage() {
 }
 
 int run(const std::vector<std::wstring>& args) {
+    if (args.size() >= 3 && args[1] == L"benchmark") {
+        const auto drive = drive_letter(args[2]);
+        auto size_mib = kBenchmarkDefaultMiB;
+        bool json = false;
+        for (std::size_t i = 3; i < args.size(); ++i) {
+            if (args[i] == L"--json") json = true;
+            else if (args[i] == L"--size-mib" && i + 1 < args.size())
+                size_mib = benchmark_size(args[++i]);
+            else { usage(); return 2; }
+        }
+        managed_benchmark(drive, size_mib, json);
+        return 0;
+    }
     if (args.size() == 5 && args[1] == L"move-member")
         return move_member(args[2], args[3], args[4]);
     if ((args.size() == 3 || args.size() == 4) && args[1] == L"health-config" &&

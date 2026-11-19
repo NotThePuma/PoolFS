@@ -118,6 +118,11 @@ from the command line with `.\build\poolfsctl.exe stats R:`; add `--watch` for
 continuous updates or `--json` for machine-readable output. These speeds count
 completed file reads and writes served by PoolFS, not physical disk traffic.
 
+Use **Run benchmark** on **Activity** or run
+`.\build\poolfsctl.exe benchmark R: --size-mib 32` for a sequential read/write
+test on a mounted pool. The test checks the bytes it reads and removes its
+temporary file. Add `--json` for machine-readable results.
+
 Open **Health** after loading a saved config to see each required member's
 status, host drive, and available host space. The same report is available as
 `.\build\poolfsctl.exe health-config .\my-pool.json` (add `--json` for structured

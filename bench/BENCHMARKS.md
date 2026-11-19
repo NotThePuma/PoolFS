@@ -1,5 +1,17 @@
 # PoolFS benchmark harness
 
+For a quick sequential test on a current mounted pool, use **Activity → Run
+benchmark** in the manager or run:
+
+```powershell
+.\build\poolfsctl.exe benchmark Q: --size-mib 32 --json
+```
+
+The quick test writes and reads one temporary file in 1 MiB unbuffered chunks,
+includes a final flush in write time, and verifies every byte read outside the
+read timer. Backing image I/O may still be cached by the host filesystem. Use
+the development harness below for the historical workloads and metrics.
+
 Run `build.ps1` to build `poolfs-bench.exe`, then run it against a
 mounted test pool with enough unallocated space:
 

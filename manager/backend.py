@@ -156,14 +156,17 @@ class NativeBackend:
     def discover_config(self, path: str) -> dict[str, Any]:
         return self._call("discover_config", path)
 
-    def move_member(self, config: str, source: str, destination: str) -> str:
+    def _run_controller(self, *arguments: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         controller = self.path.parent / "poolfsctl.exe"
+        return subprocess.run(
+            [str(controller), *arguments], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW,
+            check=False, timeout=timeout,
+        )
+
+    def move_member(self, config: str, source: str, destination: str) -> str:
         try:
-            result = subprocess.run(
-                [str(controller), "move-member", config, source, destination],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW, check=False,
-            )
+            result = self._run_controller("move-member", config, source, destination)
         except FileNotFoundError as exc:
             raise BridgeError("Moving a member requires poolfsctl.exe beside the native library.") from exc
         if result.returncode != 0:
@@ -171,14 +174,8 @@ class NativeBackend:
         return result.stderr.strip()
 
     def health_config(self, path: str) -> dict[str, Any]:
-        controller = self.path.parent / "poolfsctl.exe"
         try:
-            result = subprocess.run(
-                [str(controller), "health-config", path, "--json"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                check=False, timeout=15,
-            )
+            result = self._run_controller("health-config", path, "--json", timeout=15)
         except subprocess.TimeoutExpired as exc:
             raise BridgeError("Health check timed out. Check that the host drives respond and try again.") from exc
         except FileNotFoundError as exc:
@@ -266,6 +263,18 @@ class NativeBackend:
 
     def stats(self, drive: str) -> dict[str, Any]:
         return self._call("stats", drive[0])
+
+    def benchmark(self, drive: str, size_mib: int) -> dict[str, Any]:
+        try:
+            result = self._run_controller("benchmark", drive, "--size-mib", str(size_mib), "--json")
+        except FileNotFoundError as exc:
+            raise BridgeError("The benchmark needs poolfsctl.exe beside the PoolFS native library.") from exc
+        if result.returncode != 0:
+            raise BridgeError(result.stderr.strip().removeprefix("poolfsctl: ") or "Benchmark failed.")
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise BridgeError("The benchmark returned invalid data.") from exc
 
     def unmount(self, drive: str) -> dict[str, Any]:
         return self._call("unmount", drive[0])

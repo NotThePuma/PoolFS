@@ -69,6 +69,15 @@ same counters and space values are available with `poolfsctl stats V:`. Use
 `poolfsctl stats V: --watch` for continuous updates or add `--json` for one
 JSON object per sample. The mount must use a build that includes live stats.
 
+On **Activity**, choose a mounted drive, set the test file size, and select
+**Run benchmark**. The default is 32 MiB and you can choose 1–1,024 MiB. The
+selected drive needs enough free space for the test file. PoolFS reports
+sequential read and write speeds in MiB/s, verifies the read-back data, and
+removes the temporary file. The write time includes a final flush. The CLI
+equivalent is `poolfsctl benchmark V: --size-mib 32`; add `--json` to parse
+the report. These numbers measure I/O through the mounted filesystem and can
+reflect caching of the host image files.
+
 After opening a saved config, use **Health** to inspect every listed member,
 its host drive and available host space, and whether the complete set appears
 mountable. The same check is `poolfsctl health-config pool.json`; add `--json`

@@ -367,6 +367,22 @@ def main() -> None:
     assert window.stats_write_rate.text() == "2.0 MiB/s"
     assert window.stats_total_read.text() == "2 MiB"
     assert window.stats_usage.value() == 40
+    assert window.benchmark_button.isEnabled()
+    assert window.benchmark_size.value() == 32
+    window.benchmark_size.setValue(8)
+    benchmark_result = {"sizeMiB": 8, "readMiBPerSecond": 900.25, "writeMiBPerSecond": 134.5}
+    with patch.object(fake_backend, "benchmark", create=True, return_value=benchmark_result) as run:
+        window.benchmark_button.click()
+        assert window._running_operation and not window.benchmark_button.isEnabled()
+        deadline = time.monotonic() + 3
+        while window._tasks and time.monotonic() < deadline:
+            QTest.qWait(10)
+        run.assert_called_once_with("P:", 8)
+        assert window.benchmark_button.isEnabled()
+        assert window.benchmark_status.text() == "P: · Read 900.25 MiB/s · Write 134.50 MiB/s · 8 MiB tested"
+    fake_backend.mounted_drives = []
+    window._refresh_mount_state()
+    assert not window.benchmark_button.isEnabled() and window.benchmark_status.isHidden()
     window._show_health({"name": "Travel Pool", "mountable": False,
                          "driveStatus": "available", "lastVerifiedUtc": None,
                          "members": [{"path": image, "host": "C:",
